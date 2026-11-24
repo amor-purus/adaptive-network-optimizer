@@ -13,6 +13,7 @@ import time
 import core
 import validity
 import traffic
+import load as load_monitoring
 
 INTERVAL=45
 MAX_PERIODIC=120
@@ -90,7 +91,7 @@ class Monitor:
     """One periodic reader, serialized with checkpoints; no overlapping snapshot reads."""
     def __init__(self,interval=INTERVAL,limit=MAX_PERIODIC,reader=core.snapshot,wlan=wlan_snapshot):
         self.interval=interval;self.limit=limit;self.reader=reader;self.wlan=wlan
-        self.lock=threading.Lock();self.stop=threading.Event();self.records=[];self.boundary_reuses=[];self.boundary_waits=[];self.phase='dns';self.periodic=0;self.t0=time.monotonic();self.thread=None
+        self.lock=threading.Lock();self.counter_lock=threading.Lock();self.counter_indices=[];self.load_sampler=None;self.stop=threading.Event();self.records=[];self.boundary_reuses=[];self.boundary_waits=[];self.phase='dns';self.periodic=0;self.t0=time.monotonic();self.thread=None
     def _capture(self,label):
         t=time.monotonic(); stamp=datetime.datetime.now().astimezone().isoformat()
         try:s=self.reader();s=s if isinstance(s,dict) else {}
@@ -98,6 +99,8 @@ class Monitor:
         try:w=self.wlan()
         except (OSError,ValueError,TypeError):w={'status':'Unavailable','reason':'WLAN_QUERY_FAILED','interfaces':[]}
         ended=time.monotonic()
+        active_indices=[a['ifIndex'] for a in s.get('adapters',[]) if a.get('Status')=='Up' and isinstance(a.get('ifIndex'),int)] if isinstance(s,dict) else []
+        with self.counter_lock:self.counter_indices=sorted(set(active_indices))
         self.records.append(dict(label=label,phase=self.phase,observed_at=stamp,elapsed_s=round(t-self.t0,3),capture_seconds=round(ended-t,3),capture_start_s=t-self.t0,capture_end_s=ended-self.t0,snapshot=s,wlan=w))
         return s
     def checkpoint(self,label,next_phase=None):
@@ -126,11 +129,21 @@ class Monitor:
             durations=[r['capture_end_s']-r['capture_start_s'] for r in self.records[-10:]]+self.boundary_waits[-10:]
         return min(52,max(10,math.ceil(2*max(durations)+2))) if durations else 52
 
-    def traffic_sample(self):
-        with self.lock:
-            last=self.records[-1] if self.records else {}
-            indices=[a['ifIndex'] for a in last.get('snapshot',{}).get('adapters',[]) if a.get('Status')=='Up' and isinstance(a.get('ifIndex'),int)]
+    def load_sample(self):
+        # Separate short lock: full PowerShell snapshots cannot delay native counter reads.
+        with self.counter_lock:indices=list(self.counter_indices)
+        if not indices:return dict(status='Unavailable',reason='NO_ACTIVE_INTERFACE_INDEXES',interfaces=[],started=time.monotonic(),finished=time.monotonic())
         return traffic.sample(indices)
+
+    def traffic_sample(self):return self.load_sample()
+
+    def start_load_sampler(self):
+        if self.load_sampler is None:self.load_sampler=load_monitoring.LoadSampler(self.load_sample).start()
+        return self.load_sampler
+
+    def load_evidence(self):
+        if self.load_sampler is None:return dict(status='Unavailable',reason='NOT_STARTED',samples=[],sample_count=0)
+        return self.load_sampler.evidence()
 
     def overhead(self,batches):
         with self.lock:
@@ -138,9 +151,11 @@ class Monitor:
         intervals=[(b['started_elapsed_s'],b['finished_elapsed_s']) for b in batches if 'started_elapsed_s' in b and 'finished_elapsed_s' in b]
         total=sum(r['capture_end_s']-r['capture_start_s'] for r in records)
         overlap=sum(max(0,min(r['capture_end_s'],b)-max(r['capture_start_s'],a)) for r in records for a,b in intervals)
+        load=self.load_evidence()
         return dict(full_snapshots=len(records),reused_boundaries=len(reuses),reuse_events=reuses,full_capture_seconds=total,
                     overlap_with_batch_seconds=overlap,nonoverlapping_capture_seconds=max(0,total-overlap),boundary_call_seconds=sum(waits),
                     native_counter_capture_seconds=sum(b.get('traffic',{}).get('capture_seconds',0) for b in batches),
+                    load_sample_count=load.get('sample_count',0),load_sample_capture_seconds=load.get('total_capture_seconds',0),
                     scope='按时间区间核算采集开销，不推断监测造成的速度变化。')
 
     def window(self,begin,end,started,finished):
@@ -158,6 +173,7 @@ class Monitor:
     def close(self):
         self.stop.set()
         if self.thread:self.thread.join()
+        if self.load_sampler:self.load_sampler.close()
     def evidence(self,phase):
         with self.lock:
             records=list(self.records)
@@ -427,6 +443,13 @@ def write_csvs(root,env):
         for a in r['wlan'].get('interfaces',[]):
             rows.append(dict(elapsed_s=r['elapsed_s'],label=r['label'],name=a.get('name'),signal_percent=a.get('signal_percent'),rx_mbps=a.get('rx_mbps'),tx_mbps=a.get('tx_mbps')))
     write('wlan_timeline.csv',rows,['elapsed_s','label','name','signal_percent','rx_mbps','tx_mbps'])
+    load_rows=[]
+    for sample in env.get('load_monitor',{}).get('samples',[]):
+        if sample.get('interfaces'):
+            for iface in sample['interfaces']:
+                load_rows.append(dict(sample_index=sample.get('sample_index'),captured_at=sample.get('captured_at'),interval_status=sample.get('interval_status'),interval_seconds=sample.get('interval_seconds'),interface_index=iface.get('index'),interface_type=iface.get('type'),rx_mbps=iface.get('rx_mbps'),tx_mbps=iface.get('tx_mbps'),total_mbps=sample.get('total_mbps'),reason=sample.get('reason')))
+        else:load_rows.append(dict(sample_index=sample.get('sample_index'),captured_at=sample.get('captured_at'),interval_status=sample.get('interval_status'),interval_seconds=sample.get('interval_seconds'),reason=sample.get('reason')))
+    write('load_samples.csv',load_rows,['sample_index','captured_at','interval_status','interval_seconds','interface_index','interface_type','rx_mbps','tx_mbps','total_mbps','reason'])
 
 
 def report_html(env):

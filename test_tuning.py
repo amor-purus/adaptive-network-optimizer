@@ -26,6 +26,11 @@ class FakeObserver:
         ok=label not in self.bad
         return dict(verified=ok,reasons=[] if ok else ['PAIR_TELEMETRY_OUTSIDE_POLICY'],begin_index=begin,end_index=end)
 
+class FakeLoadMonitor:
+    def __init__(self,status='IDLE_WINDOW'):self.status=status
+    def wait_for_idle(self,stop,timeout):return dict(status=self.status,waited_seconds=0,median_total_mbps=.1 if self.status=='IDLE_WINDOW' else 2.0)
+    def current_state(self):return dict(idle=self.status=='IDLE_WINDOW')
+
 class TuningTests(unittest.TestCase):
     def run_fake(self,func=fake_batch,**kwargs):
         with patch('tuning.run_batch',side_effect=func):
@@ -253,6 +258,7 @@ class TuningTests(unittest.TestCase):
         wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=866.7)])
         observer=monitor.Monitor(reader=lambda:snap,wlan=lambda:wlan)
         observer.checkpoint('after_performance','tuning')
+        observer.start_load_sampler=lambda:FakeLoadMonitor()
         with patch('tuning.run_batch',side_effect=fake_batch):
             r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer,usage_mode='controlled')
         observer.checkpoint('after_tuning','done')
@@ -284,10 +290,28 @@ class TuningTests(unittest.TestCase):
         self.assertFalse(gated['global_environment_guard_passed'])
         self.assertEqual(len(gated['native_state_changes']),1)
 
+    def test_controlled_mode_stops_when_no_idle_window(self):
+        observer=FakeObserver();observer.start_load_sampler=lambda:FakeLoadMonitor('BUSY_TIMEOUT')
+        with patch('tuning.run_batch',side_effect=fake_batch):
+            r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer,usage_mode='controlled')
+        self.assertEqual(r['stop_reason'],'LOAD_WINDOW_UNAVAILABLE');self.assertEqual(r['pilots'],[]);self.assertEqual(r['batches'],[])
+        self.assertFalse(r['recommendation_allowed'])
+
+    def test_shared_busy_window_is_retained_but_not_comparable(self):
+        observer=FakeObserver();observer.start_load_sampler=lambda:FakeLoadMonitor('BUSY_TIMEOUT')
+        with patch('tuning.run_batch',side_effect=fake_batch):
+            r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer,usage_mode='shared')
+        self.assertEqual(len(r['pilots']),3);self.assertTrue(all(not p['load_window_verified'] for p in r['pilots']))
+        self.assertTrue(r['pairs']);self.assertTrue(all(not p['valid'] for p in r['pairs']))
+        self.assertFalse(r['load_window_coverage_ok'])
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        self.assertFalse(t.apply_environment_gate(r,e)['recommendation_allowed'])
+
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
             t.write_csvs(Path(d),r)
             self.assertTrue((Path(d)/'tuning_pairs.csv').exists())
+            self.assertTrue((Path(d)/'tuning_load_schedule.csv').exists())
             self.assertIn('&lt;script&gt;',t.report_html(r))
 if __name__=='__main__':unittest.main()

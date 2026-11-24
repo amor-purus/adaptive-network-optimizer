@@ -18,6 +18,13 @@ class TCP(socketserver.BaseRequestHandler):
         n=struct.unpack('!H',core.recv_exact(self.request,2,core.time.monotonic()+2))[0]
         q=core.recv_exact(self.request,n,core.time.monotonic()+2); r=reply(q);self.request.sendall(struct.pack('!H',len(r))+r)
 class Tests(unittest.TestCase):
+    def test_desktop_report_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            desktop=Path(d)/'Desktop'
+            path=core.new_report_directory(desktop=desktop,now=core.datetime.datetime(2026,11,24,12,30,0),run_id='test1234')
+            self.assertEqual(path,desktop/'AdaptiveNetworkOptimizer'/'20261124-123000-test1234')
+            self.assertTrue(path.is_relative_to(desktop))
+
     def test_domain(self):
         self.assertEqual(core.domain_name('WWW.Example.COM.'),DOMAIN)
         for s in ('foo','http://foo.com','a..com','-a.com'):

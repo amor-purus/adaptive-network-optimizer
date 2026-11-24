@@ -199,9 +199,34 @@ def mtu_probe(ip,stop,emit=lambda _:None,ping=ping_df):
     if not test(lo): return {'target':ip,'observed_mtu':None,'trials':trials,'note':'重复验证不一致，不推荐 MTU。'}
     return {'target':ip,'observed_mtu':lo+28,'trials':trials,'note':'仅为此路径、此时段成功通过的估计包大小；丢包或 ICMP 策略会干扰，不自动修改 MTU。'}
 
+def desktop_directory():
+    """Resolve the actual Windows Desktop, including OneDrive redirection."""
+    if os.name=='nt':
+        try:
+            import ctypes
+            buffer=ctypes.create_unicode_buffer(32768)
+            result=ctypes.windll.shell32.SHGetFolderPathW(None,0x10,None,0,buffer)
+            if result==0 and buffer.value:return Path(buffer.value)
+        except (AttributeError,OSError,TypeError,ValueError):pass
+    home=Path.home()
+    for candidate in (home/'Desktop',home/'OneDrive'/'Desktop'):
+        if candidate.is_dir():return candidate
+    return home/'Desktop'
+
+
+def new_report_directory(desktop=None,now=None,run_id=None):
+    stamp=(now or datetime.datetime.now()).strftime('%Y%m%d-%H%M%S')
+    token=run_id or secrets.token_hex(4)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}',str(token)):raise ValueError('无效报告标识。')
+    root=Path(desktop) if desktop is not None else desktop_directory()
+    return root/'AdaptiveNetworkOptimizer'/(stamp+'-'+str(token))
+
+
 def save_report(directory,data):
     root=Path(directory); root.mkdir(parents=True,exist_ok=False)
-    (root/'report.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    json_path=root/'report.json'; temp_path=root/'report.json.tmp'
+    temp_path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+    os.replace(temp_path,json_path)
     for name,rows in [('dns_samples.csv',data['dns_samples']),('dns_summary.csv',data['dns_summary'])]:
         with (root/name).open('w',encoding='utf-8-sig',newline='') as f:
             if rows:
@@ -228,5 +253,5 @@ def save_report(directory,data):
     valid=[r for r in s if gate and r['eligible']]; top=max((r['median_ms'] for r in valid),default=1) or 1
     bars=''.join('<p>'+esc(r['name'])+' '+esc(r['server'])+' — '+str(r['median_ms'])+' ms</p><div style="height:12px;background:#285eb3;width:%.2f%%"></div>'%(100*r['median_ms']/top) for r in valid)
     details=esc(json.dumps({'tcp':data['tcp'],'mtu':data['mtu'],'warnings':data['warnings'],'validity':data.get('validity',{})},ensure_ascii=False,indent=2))
-    (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font:16px/1.6 system-ui;max-width:1000px;margin:32px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}pre{white-space:pre-wrap}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><h2>实验有效性</h2><p>'+esc(validity.get('environment','environment_unverified'))+'：'+validity_text+'</p><p>下表为原始观测；仅通过有效性检查且完整成功的候选绘图。TCP/MTU 仅代表当前实际路径。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre>'+perf_html+'<p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
+    (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font-family:"Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;font-size:16px;line-height:1.75;color:#202938;max-width:1100px;margin:32px auto;padding:0 20px}h1,h2,h3{line-height:1.4}table{border-collapse:collapse;width:100%;margin:14px 0}td,th{border:1px solid #cbd5e1;padding:10px 12px;text-align:left;font-size:15px}th{font-weight:700;background:#f1f5f9}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.65 "Cascadia Mono","Consolas",monospace;background:#f8fafc;padding:14px;border-radius:8px}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><h2>实验有效性</h2><p>'+esc(validity.get('environment','environment_unverified'))+'：'+validity_text+'</p><p>下表为原始观测；仅通过有效性检查且完整成功的候选绘图。TCP/MTU 仅代表当前实际路径。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre>'+perf_html+'<p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
     return root

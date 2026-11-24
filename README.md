@@ -1,6 +1,6 @@
 # 自适应网络优化工具（Adaptive Network Optimizer）
 
-**v0.3.5 · Windows 11 · 简体中文 · 只读实验与参数建议原型**
+**v0.3.6 · Windows 11 · 简体中文 · 只读实验与参数建议原型**
 
 不依赖第三方 Python 库，不需要管理员权限，不修改注册表、DNS、MTU、防火墙、代理或 TCP 参数。
 
@@ -141,3 +141,14 @@
 - 已识别 WLAN 的0.1 Mbps量化速率按半个量化单位估计边界范围，跨越25%阈值标注 RATE_BOUNDARY_WITHIN_RESOLUTION；保留名义比值与范围，不将不确定边界当作通过。量化假设不表示真实计量误差已获验证。
 - 新增 tuning_traffic.csv、usage_mode、shared_load_observation_concurrency、monitoring_overhead 与 boundary_budget_trace。原质量门槛、序贯停止及只读约束不变。
 - API 参考：https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getifentry2 和 https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2
+
+
+## v0.3.6：负载感知实验调度与桌面报告体验
+
+- 并发实验前启动独立低开销采样线程，每约1秒读取活动硬件网卡的64位累计收发计数；仅选择硬件接口且操作状态为 Up、媒体连接状态为 Connected 的记录。采样使用与周期性 PowerShell 完整快照分离的短锁和缓存接口索引，不等待完整快照锁。
+- 低负载窗口定义为物理网卡总收发速率低于0.5 Mbps，连续3个有效采样区间（约3秒）。该阈值为工程启发式，不是链路空闲的绝对证明；多物理接口按接口速率求和，桥接/团队配置可能重复计数。采样不识别进程、浏览器、目的地址或流量来源。
+- 每次预探测和每个相邻配对前均尝试等待低负载窗口。共享日常模式最多等待8秒，超时后继续采集但把对应预探测/配对标记为不可比较，不输出受干扰参数推荐；受控模式最多等待20秒，仍繁忙或采样不可用则跳过后续实验，不把繁忙窗口当作受控数据。配对开始完整快照后再次确认低负载状态；若快照期间负载升高则重新等待。取消信号会中断等待。
+- 负载原始采样和调度决策写入 report.json、load_samples.csv、tuning_load_schedule.csv 与 HTML 报告。保留每次等待状态、等待时长、负载中位数/峰值及是否在繁忙窗口继续。低负载仅表示总物理接口流量低，不证明无后台任务或代理内部路径不变。
+- 自动报告位置改为实际 Windows 桌面（通过 Windows Shell 桌面目录接口解析，支持桌面重定向/OneDrive）：Desktop/AdaptiveNetworkOptimizer/时间戳-运行ID/report.json。同目录保存 HTML、CSV；JSON 使用临时文件写入后原子替换，避免留下半份文件。GUI 新增“打开 report.json”和“打开报告文件夹”。
+- GUI 统一 Microsoft YaHei UI（不可用时回退 Microsoft YaHei / Segoe UI），默认字号10–11pt，增加按钮内边距、表格行高、日志行距和窗口尺寸；HTML 报告统一中文字体栈、字号、行距与表格留白。
+- 新增低负载窗口、繁忙超时、虚拟网卡排除、接口变化、桌面路径及调度门槛回归测试。仍然只读，不自动暂停应用或修改系统设置。
