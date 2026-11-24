@@ -293,6 +293,18 @@ def annotate(summary,rounds):
     return summary
 
 
+def traffic_alignment(before,after,started,finished):
+    """All timestamps must use the same monotonic clock. Bound the whole counter envelope."""
+    values=(before.get('started'),before.get('finished'),started,finished,after.get('started'),after.get('finished'))
+    if not all(isinstance(x,(int,float)) and math.isfinite(x) for x in values):
+        return dict(window_alignment='UNVERIFIED_OR_WIDE')
+    b0,b1,s,e,a0,a1=values
+    pre=s-b1;post=a0-e;envelope=(s-b0)+(a1-e)
+    ordered=b0<=b1<=s<=e<=a0<=a1
+    return dict(pre_gap_s=pre,post_gap_s=post,counter_envelope_extra_s=envelope,
+                window_alignment='ALIGNED' if ordered and pre<=.1 and post<=.1 and envelope<=.2 else 'UNVERIFIED_OR_WIDE')
+
+
 def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CONCURRENCY_LEVELS,
         total_bytes=MAX_TOTAL_BYTES,phase_seconds=PHASE_SECONDS,seed=None,clock=time.monotonic,observer=None,usage_mode='shared'):
     if usage_mode not in ('shared','controlled'):raise ValueError('未知使用模式')
@@ -324,6 +336,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     result['seed']=seed
     rng=random.Random(seed);deadline=clock()+phase_seconds
     origin=observer.t0 if observer is not None else clock()
+    result['load_clock_origin_s']=origin
     load_monitor=None
     starter=getattr(observer,'start_load_sampler',None) if observer is not None else None
     if callable(starter):
@@ -360,11 +373,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
                      pre_batch_load_state=state,load_isolation_marked=marked)
             if sampler:
                 after=sampler();b['traffic']=traffic.delta(before,after,b['actual_bytes'])
-                if all(isinstance(x,(int,float)) and math.isfinite(x) for x in (before.get('started'),before.get('finished'),after.get('started'),after.get('finished'))):
-                    pre=started+origin-before['finished'];post=after['started']-finished-origin
-                    b['traffic'].update(pre_gap_s=pre,post_gap_s=post,
-                        window_alignment='ALIGNED' if 0<=pre<=.1 and 0<=post<=.1 else 'UNVERIFIED_OR_WIDE')
-                else:b['traffic']['window_alignment']='UNVERIFIED_OR_WIDE'
+                b['traffic'].update(traffic_alignment(before,after,started+origin,finished+origin))
             else:b['traffic']=dict(status='Unavailable',interfaces=[],reason='NO_COUNTER_PROVIDER')
             return b
         finally:
@@ -595,7 +604,11 @@ def apply_environment_gate(result,evidence):
     result['recommendation_allowed']=bool(stable and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
     result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
     result['traffic_coverage']=dict(batches=len(result.get('pilots',[]))+len(result.get('batches',[])),measured=sum(b.get('traffic',{}).get('status')=='Measured' for b in result.get('pilots',[])+result.get('batches',[])))
-    result['qualified_subset_environment_verified']=bool(stable and result.get('qualified_subset_concurrency') is not None)
+    subset=set(result.get('qualified_subset_candidates',[]))-{1}
+    subset_rows=[s for s in result.get('summary',[]) if s['concurrency'] in subset]
+    subset_coverage=bool(subset and {s['concurrency'] for s in subset_rows}==subset and all(
+        s['environment_verified_pairs']>=s['planned_rounds'] and s['environment_verified_pairs']/max(1,s['attempted_rounds'])>=.75 for s in subset_rows))
+    result['qualified_subset_environment_verified']=bool(global_ok and subset_coverage and result.get('qualified_subset_concurrency') is not None)
     result['shared_load_observation_concurrency']=None
     if result.get('usage_mode')=='shared' and result['recommendation_allowed']:
         result['shared_load_observation_concurrency']=result['selected_concurrency']
@@ -621,8 +634,8 @@ def write_csvs(root,result):
             w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
             for r in rows:w.writerow({k:r.get(k) for k in fields})
     batches=result.get('batches',[])
-    traffic_rows=[dict(pair_id=b.get('pair_id'),pilot_index=b.get('pilot_index'),concurrency=b.get('concurrency'),round=b.get('round'),test_body_bytes=b.get('actual_bytes'),interval_seconds=b.get('traffic',{}).get('interval_seconds'),**r) for b in result.get('pilots',[])+batches for r in b.get('traffic',{}).get('interfaces',[])]
-    write('tuning_traffic.csv',traffic_rows,['pair_id','pilot_index','concurrency','round','index','status','reason','hardware','type','test_body_bytes','interval_seconds','rx_bytes','tx_bytes','rx_mbps','tx_mbps','rx_to_test_body_ratio'])
+    traffic_rows=[dict(pair_id=b.get('pair_id'),pilot_index=b.get('pilot_index'),concurrency=b.get('concurrency'),round=b.get('round'),test_body_bytes=b.get('actual_bytes'),interval_seconds=b.get('traffic',{}).get('interval_seconds'),window_alignment=b.get('traffic',{}).get('window_alignment'),pre_gap_s=b.get('traffic',{}).get('pre_gap_s'),post_gap_s=b.get('traffic',{}).get('post_gap_s'),counter_envelope_extra_s=b.get('traffic',{}).get('counter_envelope_extra_s'),**r) for b in result.get('pilots',[])+batches for r in b.get('traffic',{}).get('interfaces',[])]
+    write('tuning_traffic.csv',traffic_rows,['pair_id','pilot_index','concurrency','round','index','status','reason','hardware','type','test_body_bytes','interval_seconds','window_alignment','pre_gap_s','post_gap_s','counter_envelope_extra_s','rx_bytes','tx_bytes','rx_mbps','tx_mbps','rx_to_test_body_ratio'])
     pilot_rows=[dict(p,load_window_status=p.get('load_window',{}).get('status'),load_wait_seconds=p.get('load_window',{}).get('waited_seconds')) for p in result.get('pilots',[])]
     write('tuning_pilots.csv',pilot_rows,['pilot_index','status','expected_bytes','actual_bytes','elapsed_s','aggregate_mbps','started_elapsed_s','finished_elapsed_s','started_at_utc','finished_at_utc','error_categories','load_window_status','load_wait_seconds'])
     write('tuning_load_schedule.csv',result.get('load_schedule',[]),['stage','status','action','waited_seconds','timeout_seconds','median_total_mbps','max_total_mbps','threshold_mbps','threshold_cap_mbps','baseline_p25_mbps','baseline_mode','baseline_count','interval_count','start_sample_index','end_sample_index','window_start_s','window_end_s','cooldown_until_s','boundary_confirmation','reason'])

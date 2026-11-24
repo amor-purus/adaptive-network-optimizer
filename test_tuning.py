@@ -319,6 +319,13 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(r['eliminated_candidates'][0]['skipped_formal_pairs'],1)
         self.assertEqual(r['qualified_subset_candidates'],[1,2,4])
         self.assertEqual(r['qualified_subset_concurrency'],4)
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        gated=t.apply_environment_gate(r,e)
+        self.assertTrue(gated['qualified_subset_environment_verified'])
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertIsNone(gated['selected_concurrency'])
+        e['observed_stable']=False
+        self.assertFalse(t.apply_environment_gate(r,e)['qualified_subset_environment_verified'])
         self.assertFalse(r['comparison_ready'])
         self.assertIsNone(r['selected_concurrency'])
     def test_load_isolation_marks_all_batches_but_does_not_split_pairs(self):
@@ -337,6 +344,12 @@ class TuningTests(unittest.TestCase):
         self.assertTrue(all(p['measurement_valid'] and not p['valid'] for p in r['pairs']))
         self.assertGreater(r['measurement_summary'][0]['paired_rounds'],0)
         self.assertFalse(r['comparison_ready'])
+    def test_traffic_alignment_checks_entire_counter_envelope(self):
+        before=dict(started=1.,finished=1.01);after=dict(started=2.01,finished=2.02)
+        self.assertEqual(t.traffic_alignment(before,after,1.02,2.)['window_alignment'],'ALIGNED')
+        self.assertEqual(t.traffic_alignment(dict(before,started=.5),after,1.02,2.)['window_alignment'],'UNVERIFIED_OR_WIDE')
+        self.assertEqual(t.traffic_alignment(before,dict(after,started=1.99),1.02,2.)['window_alignment'],'UNVERIFIED_OR_WIDE')
+        self.assertEqual(t.traffic_alignment({},after,1.02,2.)['window_alignment'],'UNVERIFIED_OR_WIDE')
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
