@@ -440,7 +440,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         result['randomized_order'].append(dict(pair_id=ident,order=order))
         measured={}
         begin,load_window=schedule_pair_boundary(ident,reserve_seconds)
-        if begin is None:
+        if begin is None and result['load_scheduler_enabled']:
             result['load_window_unavailable']=True
             result['load_window_stop_reason']='受控模式在等待期限内未检测到连续低负载窗口。'
             return False
