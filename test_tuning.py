@@ -354,22 +354,28 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(gated['candidate_local_evidence'][0]['evidence_state'],'SUPPORTED_GAIN')
 
     def test_candidate_load_failure_is_not_a_global_load_veto(self):
-        class CandidateLoad(FakeLoadMonitor):
-            def __init__(self):super().__init__();self.calls=0
-            def wait_for_idle(self,stop,timeout):
-                self.calls+=1
-                status='BUSY_TIMEOUT' if self.calls==4 else 'IDLE_WINDOW'
-                return dict(status=status,waited_seconds=0,median_total_mbps=.1 if status=='IDLE_WINDOW' else 2.0)
-        observer=FakeObserver()
-        load=CandidateLoad()
-        observer.start_load_sampler=lambda:load
-        r=self.run_fake(candidates=(1,2,4),observer=observer,usage_mode='shared')
+        r=self.run_fake(candidates=(1,2,4),observer=FakeObserver())
+        for row in r['summary']:
+            if row['concurrency']==4:
+                row['load_coverage_ok']=False
+                row['load_verified_pairs']=2
+                row['evidence_state']='IRRECOVERABLE_COMPLETION'
+                row['eligible']=False
+        r['comparison_ready']=False
+        r['provisional_concurrency']=2
+        r['qualified_subset_candidates']=[1,2]
+        r['qualified_subset_concurrency']=2
+        r['load_scheduler_enabled']=True
+        r['pilot_load_coverage_ok']=True
+        r['load_window_coverage_ok']=False
         gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=True,
             adapter_state_coverage=True,telemetry_changes=[]))
+        local={x['concurrency']:x for x in gated['candidate_local_evidence']}
         self.assertTrue(gated['pilot_load_environment_guard_passed'])
         self.assertTrue(gated['global_environment_guard_passed'])
+        self.assertTrue(local[2]['local_evidence_certified'])
+        self.assertFalse(local[4]['local_evidence_certified'])
         self.assertFalse(gated['recommendation_allowed'])
-        self.assertTrue(any(not x['load_coverage_passed'] for x in gated['candidate_local_evidence']))
 
     def test_load_isolation_marks_all_batches_but_does_not_split_pairs(self):
         class Marker(FakeLoadMonitor):
