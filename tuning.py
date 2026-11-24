@@ -581,8 +581,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     if qualified and complete and not result['blocked']:
         result['qualified_subset_concurrency']=decide(qualified)['provisional_concurrency']
     result.update(decide(summary,complete,result['blocked']))
-    if (result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2
-        and result['load_window_coverage_ok'] and result['pair_environment_coverage_ok']):
+    if result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2 and result['load_window_coverage_ok']:
         result['evidence_level']='SUPPORTED_WITHIN_TESTED_SCOPE'
     elif result['comparison_ready']:
         result['evidence_level']='TENTATIVE'

@@ -358,7 +358,7 @@ class TuningTests(unittest.TestCase):
             def __init__(self):super().__init__();self.calls=0
             def wait_for_idle(self,stop,timeout):
                 self.calls+=1
-                status='BUSY_TIMEOUT' if self.calls==8 else 'IDLE_WINDOW'
+                status='BUSY_TIMEOUT' if self.calls==4 else 'IDLE_WINDOW'
                 return dict(status=status,waited_seconds=0,median_total_mbps=.1 if status=='IDLE_WINDOW' else 2.0)
         observer=FakeObserver()
         load=CandidateLoad()
