@@ -91,6 +91,37 @@ class MonitorTests(unittest.TestCase):
         e=m.phase_evidence([a,b],'tuning')
         self.assertFalse(e['telemetry_complete'])
 
+    def test_tuning_upward_rate_is_grouped_advisory(self):
+        def full(label,seconds,rate,signal=99):
+            s=copy.deepcopy(BASE);s.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',LinkSpeed=str(rate)+' Mbps',ReceiveLinkSpeed=866700000,TransmitLinkSpeed=int(rate*1000000),MediaConnectionState=1)])
+            return dict(label=label,phase='tuning',elapsed_s=seconds,observed_at='test',snapshot=s,wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=signal,rx_mbps=866.7,tx_mbps=rate)]))
+        a=full('after_performance',0,433.3);b=full('after_tuning',45,866.7)
+        e=m.phase_evidence([a,b],'tuning')
+        self.assertFalse(e['telemetry_observed_stable'])
+        self.assertTrue(e['tuning_telemetry_acceptable'])
+        events=e['tuning_radio_assessment']['advisory_events']
+        self.assertEqual(len(events),1);self.assertEqual(len(events[0]['fields']),3)
+        self.assertFalse(m.phase_evidence([full('after_performance',0,866.7),full('after_tuning',45,433.3)],'tuning')['tuning_telemetry_acceptable'])
+        self.assertFalse(m.phase_evidence([a,full('after_tuning',45,866.7,90)],'tuning')['tuning_telemetry_acceptable'])
+        b['wlan']['interfaces'][0].pop('tx_mbps')
+        self.assertFalse(m.phase_evidence([a,b],'tuning')['tuning_telemetry_acceptable'])
+
+    def test_cumulative_signal_drift_is_not_tolerated(self):
+        def r(label,n,signal):
+            s=copy.deepcopy(BASE);s.update(adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up',ifIndex=16)])
+            return dict(label=label,elapsed_s=n,observed_at='test',snapshot=s,wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=signal,rx_mbps=300,tx_mbps=300)]))
+        e=m.phase_evidence([r('after_performance',0,99),r('periodic',45,95),r('after_tuning',90,91)],'tuning')
+        self.assertFalse(e['tuning_telemetry_acceptable'])
+
+    def test_cumulative_link_rate_drop_blocks_tuning(self):
+        def r(label,n,rate):
+            s=copy.deepcopy(BASE);s.update(adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up',ifIndex=16)])
+            return dict(label=label,elapsed_s=n,observed_at='test',snapshot=s,wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=rate)]))
+        e=m.phase_evidence([r('after_performance',0,800),r('periodic',45,650),r('after_tuning',90,550)],'tuning')
+        self.assertTrue(e['telemetry_observed_stable'])
+        self.assertFalse(e['tuning_telemetry_acceptable'])
+        self.assertEqual(len(e['tuning_radio_assessment']['cumulative_rate_drops']),1)
+
     def test_exports(self):
         env=dict(timeline=[rec('start',BASE,0)],phases=[],ipv6_diagnosis={'note':'<script>'})
         with tempfile.TemporaryDirectory() as d:

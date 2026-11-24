@@ -18,7 +18,7 @@ import tuning
 class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
-        root.title('自适应网络优化工具 0.3.1'); root.geometry('950x800'); root.minsize(760,660)
+        root.title('自适应网络优化工具 0.3.2'); root.geometry('950x800'); root.minsize(760,660)
         f=ttk.Frame(root,padding=20); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=('Microsoft YaHei UI',20)).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置').pack(anchor='w',pady=(4,14))
@@ -38,8 +38,8 @@ class App:
         ttk.Label(perf,text='单轮下载上限 MiB').grid(row=0,column=2,sticky='w')
         ttk.Combobox(perf,textvariable=self.sample,values=('1','2','4'),state='readonly',width=6).grid(row=0,column=3,padx=5)
         tuning_box=ttk.LabelFrame(f,text='自动参数调优实验',padding=8); tuning_box.pack(fill='x',pady=(0,8))
-        ttk.Checkbutton(tuning_box,text='下载并发度自动寻优（1 / 2 / 4 / 8 路；自适应样本；最多一组配对补测）',variable=self.tune).pack(anchor='w')
-        ttk.Label(tuning_box,text='随机化候选顺序，按上方重复轮数执行；每线程 64–256 KiB 自适应采样，最多补测一组基线与候选；只测当前 HTTPS 路径，不修改系统配置，也不直接设置 yt-dlp 参数。').pack(anchor='w')
+        ttk.Checkbutton(tuning_box,text='下载并发度寻优（预探测后锁定样本；相邻配对；最多一组补测）',variable=self.tune).pack(anchor='w')
+        ttk.Label(tuning_box,text='预探测后固定总字节与超时；每个候选独立相邻基线，慢网可能缩减候选。只测当前 HTTPS 路径。').pack(anchor='w')
         self.selected={}
         servers=ttk.LabelFrame(f,text='公开 DNS 候选（当前网卡的 IPv4 DNS 自动加入）',padding=8); servers.pack(fill='x',pady=(0,12))
         for i,(label,ip) in enumerate(core.PRESETS.items()):
@@ -117,7 +117,7 @@ class App:
                 env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
                 core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
-                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.1','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.2','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=Path.home()/'Downloads'/'AdaptiveNetworkOptimizer'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))

@@ -4,6 +4,7 @@ import datetime
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import subprocess
@@ -199,6 +200,64 @@ def telemetry_stability(changes):
                             adapter_status_and_media_state='no_change_allowed'))
 
 
+def tuning_radio_assessment(records,classified):
+    """Keep raw field changes, group corroborating fields, and distinguish upward PHY adjustments.
+    A rate increase is not proof of a benign cause; the paired performance gate remains mandatory.
+    """
+    active_names=set()
+    for r in records:
+        for a in r.get('snapshot',{}).get('adapters',[]):
+            if a.get('Status')=='Up' and re.search(r'wlan|wi-?fi|wireless',str(a.get('Name','')),re.I):
+                active_names.add(a['Name'])
+        for a in r.get('wlan',{}).get('interfaces',[]):
+            if a.get('name'):active_names.add(a['name'])
+    signals={name:[] for name in active_names}
+    rates={name:{'rx_mbps':[],'tx_mbps':[]} for name in active_names}
+    complete=bool(records) and all(r.get('snapshot',{}).get('adapters') for r in records)
+    for r in records:
+        wlan=r.get('wlan',{})
+        rows={a.get('name'):a for a in wlan.get('interfaces',[])}
+        adapters={a.get('Name'):a for a in r.get('snapshot',{}).get('adapters',[])}
+        for name in active_names:
+            a=rows.get(name,{}); adapter=adapters.get(name,{})
+            values=[a.get(k) for k in ('signal_percent','rx_mbps','tx_mbps')]
+            if (wlan.get('status')!='Measured' or adapter.get('Status')!='Up' or
+                not all(isinstance(v,(int,float)) and math.isfinite(v) for v in values) or
+                not 0<=values[0]<=100 or min(values[1:])<=0):
+                complete=False;continue
+            signals[name].append(values[0])
+            rates[name]['rx_mbps'].append(values[1]);rates[name]['tx_mbps'].append(values[2])
+    signal_stable=all(v and max(v)-min(v)<=5 for v in signals.values())
+    hard=[]; advisory=[]; groups={}; cumulative_drops=[]
+    for name,fields in rates.items():
+        for field,values in fields.items():
+            peak=0
+            for value in values:
+                peak=max(peak,value)
+                if value<peak*.75:
+                    cumulative_drops.append(dict(adapter=name,field=field,peak_mbps=peak,observed_mbps=value,classification='CUMULATIVE_RATE_DROP'));break
+    for c in classified:
+        field=c['field']; name=c['identity'][-1] if c.get('identity') else None
+        if c.get('severity')!='significant':continue
+        if name in active_names and field in ('LinkSpeed','ReceiveLinkSpeed','TransmitLinkSpeed','rx_mbps','tx_mbps'):
+            x=_rate_value(c.get('before'),field);y=_rate_value(c.get('after'),field)
+            if complete and signal_stable and x is not None and y is not None and math.isfinite(x) and math.isfinite(y) and 0<x<y:
+                # Group identical numeric transitions on the same adapter and observation interval.
+                # Keep all original fields, including direction, for audit.
+                k=(name,c.get('from_elapsed_s'),c.get('to_elapsed_s'),round(x/1e5),round(y/1e5))
+                groups.setdefault(k,[]).append(c)
+                continue
+        hard.append(c)
+    for k,rows in groups.items():
+        advisory.append(dict(adapter=k[0],from_elapsed_s=k[1],to_elapsed_s=k[2],
+                             before_bps=round(k[3]*1e5),after_bps=round(k[4]*1e5),
+                             fields=[{'section':x['section'],'field':x['field']} for x in rows],
+                             classification='WLAN_UPWARD_RATE_CHANGE_UNATTRIBUTED'))
+    return dict(acceptable=bool(complete and signal_stable and not hard and not cumulative_drops),complete=complete,
+                signal_range_acceptable=signal_stable,advisory_events=advisory,hard_changes=hard,cumulative_rate_drops=cumulative_drops,
+                scope='无线速率上升、信号全程波动≤5个百分点且连接状态不变时仅作旁证；大幅下降、状态变化、缺失或信号超限仍拦截。相同时间与数值变化合并为一个观测事件，不推断因果。')
+
+
 def phase_evidence(records,phase):
     bounds={'dns':('start','after_dns'),'performance':('after_dns','after_performance'),
             'tuning':('after_performance','after_tuning')}
@@ -216,6 +275,7 @@ def phase_evidence(records,phase):
     ok=bool(rs) and all(complete(r['snapshot']) for r in rs)
     telemetry_ok=bool(rs) and all(telemetry_available(r) for r in rs)
     assessment=telemetry_stability(telemetry_changes)
+    radio=tuning_radio_assessment(rs,assessment['classified_changes']) if phase=='tuning' else None
     return dict(phase=phase,samples=len(rs),complete=ok,observed_stable=bool(ok and not changes),changes=changes,
                 telemetry_complete=telemetry_ok,
                 telemetry_observed_stable=bool(telemetry_ok and assessment['stable']),
@@ -223,6 +283,8 @@ def phase_evidence(records,phase):
                 telemetry_tolerated_changes=assessment['tolerated_changes'],
                 telemetry_significant_changes=assessment['significant_changes'],
                 telemetry_tolerance_policy=assessment['policy'],
+                tuning_radio_assessment=radio,
+                tuning_telemetry_acceptable=bool(telemetry_ok and radio['acceptable']) if radio is not None else None,
                 scope='配置变化仍严格拦截；无线信号变化不超过 5 个百分点、链路速率变化不超过 25% 时按遥测噪声容差处理。适配器连接状态变化仍严格拦截。仅为离散采样观察，不能证明采样间隙持续不变。')
 
 
