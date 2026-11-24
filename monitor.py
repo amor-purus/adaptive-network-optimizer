@@ -447,9 +447,9 @@ def write_csvs(root,env):
     for sample in env.get('load_monitor',{}).get('samples',[]):
         if sample.get('interfaces'):
             for iface in sample['interfaces']:
-                load_rows.append(dict(sample_index=sample.get('sample_index'),captured_at=sample.get('captured_at'),interval_status=sample.get('interval_status'),interval_seconds=sample.get('interval_seconds'),interface_index=iface.get('index'),interface_type=iface.get('type'),rx_mbps=iface.get('rx_mbps'),tx_mbps=iface.get('tx_mbps'),total_mbps=sample.get('total_mbps'),reason=sample.get('reason')))
-        else:load_rows.append(dict(sample_index=sample.get('sample_index'),captured_at=sample.get('captured_at'),interval_status=sample.get('interval_status'),interval_seconds=sample.get('interval_seconds'),reason=sample.get('reason')))
-    write('load_samples.csv',load_rows,['sample_index','captured_at','interval_status','interval_seconds','interface_index','interface_type','rx_mbps','tx_mbps','total_mbps','reason'])
+                load_rows.append(dict(sample_index=sample.get('sample_index'),captured_at=sample.get('captured_at'),interval_status=sample.get('interval_status'),interval_seconds=sample.get('interval_seconds'),interface_index=iface.get('index'),interface_type=iface.get('type'),rx_mbps=iface.get('rx_mbps'),tx_mbps=iface.get('tx_mbps'),total_mbps=sample.get('total_mbps'),window_class=sample.get('window_class'),interval_start_s=sample.get('interval_start_s'),interval_end_s=sample.get('interval_end_s'),idle_threshold_mbps=sample.get('idle_threshold_mbps'),baseline_mode=sample.get('baseline_mode'),reason=sample.get('reason')))
+        else:load_rows.append(dict(sample_index=sample.get('sample_index'),captured_at=sample.get('captured_at'),interval_status=sample.get('interval_status'),interval_seconds=sample.get('interval_seconds'),window_class=sample.get('window_class'),interval_start_s=sample.get('interval_start_s'),interval_end_s=sample.get('interval_end_s'),idle_threshold_mbps=sample.get('idle_threshold_mbps'),baseline_mode=sample.get('baseline_mode'),reason=sample.get('reason')))
+    write('load_samples.csv',load_rows,['sample_index','captured_at','interval_status','interval_seconds','interface_index','interface_type','rx_mbps','tx_mbps','total_mbps','window_class','interval_start_s','interval_end_s','idle_threshold_mbps','baseline_mode','reason'])
 
 
 def report_html(env):
