@@ -29,7 +29,7 @@ class FakeObserver:
 class TuningTests(unittest.TestCase):
     def run_fake(self,func=fake_batch,**kwargs):
         with patch('tuning.run_batch',side_effect=func):
-            return t.run(threading.Event(),exe='curl',seed=4,clock=lambda:0,**kwargs)
+            return t.run(threading.Event(),exe='curl',seed=4,clock=lambda:0,usage_mode=kwargs.pop('usage_mode','controlled'),**kwargs)
     def test_exact_split_and_invalid(self):
         for c in (1,2,4,8):
             sizes=t.split_sizes(t.AGGREGATE_BYTES,c)
@@ -254,7 +254,7 @@ class TuningTests(unittest.TestCase):
         observer=monitor.Monitor(reader=lambda:snap,wlan=lambda:wlan)
         observer.checkpoint('after_performance','tuning')
         with patch('tuning.run_batch',side_effect=fake_batch):
-            r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer)
+            r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer,usage_mode='controlled')
         observer.checkpoint('after_tuning','done')
         self.assertEqual(len(r['pairs']),3)
         for p in r['pairs']:
@@ -265,6 +265,24 @@ class TuningTests(unittest.TestCase):
         gated=t.apply_environment_gate(r,observer.evidence('tuning'))
         self.assertEqual(gated['selected_concurrency'],2)
         self.assertEqual(gated['environment_evidence_level'],'VERIFIED_PAIR_SCOPE')
+
+    def test_shared_mode_is_observation_not_formal_recommendation(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver(),usage_mode='shared')
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        gated=t.apply_environment_gate(r,e)
+        self.assertEqual(gated['shared_load_observation_concurrency'],2)
+        self.assertIsNone(gated['selected_concurrency'])
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertEqual(gated['evidence_level'],'TENTATIVE')
+
+    def test_native_state_change_blocks_even_if_full_snapshots_stable(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver())
+        r['batches'][0]['traffic']=dict(status='Unavailable',interfaces=[dict(index=16,reason='INTERFACE_STATE_CHANGED')])
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        gated=t.apply_environment_gate(r,e)
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertFalse(gated['global_environment_guard_passed'])
+        self.assertEqual(len(gated['native_state_changes']),1)
 
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'

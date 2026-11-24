@@ -136,6 +136,24 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(m.window_evidence(rs,None,3,11,19)['verified'])
         rs[2]['wlan']['interfaces'][0]['signal_percent']=90
         self.assertFalse(m.window_evidence(rs,1,3,11,19)['verified'])
+    def test_rate_boundary_precision(self):
+        c=dict(field='tx_mbps',identity=['WLAN'],before=866.7,after=650)
+        r=m.classify_telemetry_change(c)
+        self.assertEqual(r['severity'],'boundary_uncertain')
+        self.assertLessEqual(r['relative_change_lower'],.25)
+        self.assertGreater(r['relative_change_upper'],.25)
+        self.assertEqual(m.classify_telemetry_change(dict(c,after=600))['severity'],'significant')
+        self.assertEqual(m.classify_telemetry_change(dict(c,after=700))['severity'],'tolerated')
+    def test_fresh_boundary_reuse(self):
+        s=copy.deepcopy(BASE);s.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',MediaConnectionState=1)])
+        w=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=866.7)])
+        o=m.Monitor(reader=lambda:s,wlan=lambda:w);o.phase='tuning'
+        first=o.mark('tuning_pilot_end');second=o.mark('pair_C2-R1_begin')
+        self.assertEqual(first,second);self.assertEqual(len(o.records),1)
+        self.assertEqual(o.overhead([])['reused_boundaries'],1)
+        self.assertGreaterEqual(o.boundary_reserve(),10)
+        o.records[0]['capture_end_s']-=2
+        self.assertNotEqual(o.mark('pair_C2-R2_begin'),first)
     def test_exports(self):
         env=dict(timeline=[rec('start',BASE,0)],phases=[],ipv6_diagnosis={'note':'<script>'})
         with tempfile.TemporaryDirectory() as d:
