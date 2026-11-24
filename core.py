@@ -15,6 +15,8 @@ import struct
 import subprocess
 import time
 
+VERSION = '0.3.8'
+
 PRESETS={'Cloudflare':'1.1.1.1','Google':'8.8.8.8','Quad9':'9.9.9.9','AliDNS':'223.5.5.5','DNSPod':'119.29.29.29'}
 DOMAINS=('www.microsoft.com','www.github.com','www.youtube.com','www.baidu.com')
 

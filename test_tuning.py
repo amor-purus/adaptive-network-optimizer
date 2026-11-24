@@ -19,6 +19,8 @@ class FakeObserver:
     t0=0
     def __init__(self,bad=()):
         self.labels=[];self.bad=set(bad)
+    def start_load_sampler(self):
+        return FakeLoadMonitor()
     def mark(self,label):
         self.labels.append(label);return len(self.labels)-1
     def window(self,begin,end,started,finished):
@@ -393,6 +395,30 @@ class TuningTests(unittest.TestCase):
         self.assertTrue(all(p['measurement_valid'] and not p['valid'] for p in r['pairs']))
         self.assertGreater(r['measurement_summary'][0]['paired_rounds'],0)
         self.assertFalse(r['comparison_ready'])
+        gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=True,adapter_state_coverage=True))
+        local=gated['candidate_local_evidence'][0]
+        self.assertTrue(local['measurement_quality_passed'])
+        self.assertFalse(local['local_evidence_certified'])
+    def test_unmonitored_load_never_certifies_a_candidate(self):
+        observer=FakeObserver()
+        observer.start_load_sampler=None
+        r=self.run_fake(candidates=(1,2),observer=observer)
+        gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=True,adapter_state_coverage=True))
+        self.assertFalse(gated['global_environment_guard_passed'])
+        self.assertFalse(gated['candidate_local_evidence'][0]['local_evidence_certified'])
+        self.assertIsNone(gated['selected_concurrency'])
+    def test_different_protocols_between_candidates_only_allow_local_results(self):
+        r=self.run_fake(candidates=(1,2,4),observer=FakeObserver())
+        # Both workers of a pair negotiated the same protocol; the competing candidate used another one.
+        for pair in r['pairs']:
+            if pair['concurrency']==4:
+                pair['http_version']='1.1'
+        r['summary']=t.annotate(t.summarize_pairs(r['pairs'],r['candidates'],r['rounds']),r['rounds'])
+        gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=True,adapter_state_coverage=True))
+        self.assertTrue(all(row['local_evidence_certified'] for row in gated['candidate_local_evidence']))
+        self.assertEqual(gated['decision'],'HTTP_PROTOCOLS_DIFFER')
+        self.assertIsNone(gated['selected_concurrency'])
+        self.assertIsNone(gated['qualified_subset_concurrency'])
     def test_traffic_alignment_checks_entire_counter_envelope(self):
         before=dict(started=1.,finished=1.01);after=dict(started=2.01,finished=2.02)
         self.assertEqual(t.traffic_alignment(before,after,1.02,2.)['window_alignment'],'ALIGNED')

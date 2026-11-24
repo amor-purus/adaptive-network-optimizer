@@ -1,40 +1,43 @@
-"""Local, atomic persistence and conservative cross-run validation of paired evidence."""
-import datetime
+"""Persist paired HTTPS observations and validate independent measurement sessions."""
+from collections import defaultdict
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import platform
 import sqlite3
-import statistics
+import time
 import uuid
-from pathlib import Path
 
-SCHEMA_VERSION = 1
-QUALITY_POLICY_ID = "adjacent-paired-quality-v1"
-ENDPOINT = "https://speed.cloudflare.com/__down?bytes={size}"
-COMPARABILITY_REASONS = {
-    "CONTROL_VARIABLE_MISMATCH",
-    "PAIR_IDENTITY_INVALID",
-    "HTTP_PROTOCOL_MISMATCH_OR_MISSING",
-}
+import core
+import tuning
+
+SCHEMA_VERSION = 2
+QUALITY_POLICY_ID = "adjacent-paired-quality-v2"
+SUPPORTED = {"SUPPORTED_GAIN", "SUPPORTED_NO_GAIN"}
 
 
 def default_store_path():
     if os.name == "nt":
-        root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        root = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
     else:
-        root = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        root = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
     return Path(root) / "AdaptiveNetworkOptimizer" / "evidence.sqlite3"
 
 
 def _json(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _digest(value):
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
 def network_fingerprint(snapshot):
-    """Hash only stable interface, DNS and route configuration; never persist raw identifiers."""
-    if not isinstance(snapshot, dict):
+    """Ignore row enumeration order, but preserve Windows resolver priority."""
+    if not isinstance(snapshot, dict) or not snapshot.get("interfaces"):
         return None
     fields = {
         "interfaces": ("InterfaceIndex", "InterfaceAlias", "AddressFamily", "NlMtu",
@@ -42,357 +45,297 @@ def network_fingerprint(snapshot):
         "dns": ("InterfaceIndex", "InterfaceAlias", "AddressFamily", "ServerAddresses"),
         "routes": ("InterfaceIndex", "DestinationPrefix", "NextHop", "RouteMetric"),
     }
-    payload = {}
+    config = {}
     for section, names in fields.items():
-        values = snapshot.get(section)
-        if not isinstance(values, list):
+        rows = snapshot.get(section)
+        if not isinstance(rows, list):
             return None
-        rows = []
-        for row in values:
-            if not isinstance(row, dict):
+        values = []
+        for row in rows:
+            if not isinstance(row, dict) or not all(key in row for key in names):
                 return None
-            item = {name: row.get(name) for name in names}
-            if section == "dns" and isinstance(item.get("ServerAddresses"), list):
-                item["ServerAddresses"] = sorted(item["ServerAddresses"])
-            rows.append(item)
-        if section == "interfaces" and not rows:
-            return None
-        payload[section] = sorted(rows, key=_json)
-    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+            if row["InterfaceIndex"] is None or (section == "dns" and not isinstance(row["ServerAddresses"], list)):
+                return None
+            values.append([row[key] for key in names])
+        config[section] = sorted(values, key=_json)
+    return _digest(config)
 
 
 def _context_id(result, fingerprint):
-    plan = result.get("formal_plan") or {}
-    candidates = sorted(set(result.get("candidates") or plan.get("candidates") or []))
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "quality_policy_id": QUALITY_POLICY_ID,
-        "platform": platform.system(),
-        "parameter": result.get("parameter"),
-        "scope": result.get("scope"),
-        "endpoint": ENDPOINT,
-        "usage_mode": result.get("usage_mode"),
-        "rounds": result.get("rounds"),
-        "candidates": candidates,
-        "total_bytes": plan.get("total_bytes"),
-        "connect_timeout_seconds": plan.get("connect_timeout_seconds"),
-        "max_time_seconds": plan.get("max_time_seconds"),
-        "load_policy": result.get("load_policy") or {},
-        "network_fingerprint": fingerprint,
-    }
-    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+    plan = result["formal_plan"]
+    return _digest({
+        "policy": QUALITY_POLICY_ID, "platform": platform.system(), "network": fingerprint,
+        "parameter": result["parameter"], "design": result["design"], "scope": result["scope"],
+        "endpoint": tuning.DOWNLOAD_URL, "mode": result["usage_mode"], "rounds": result["rounds"],
+        "candidates": sorted(result["candidates"]), "load_policy": result["load_policy"],
+        "total_bytes": plan["total_bytes"], "connect_timeout": plan["connect_timeout_seconds"],
+        "transfer_timeout": plan["max_time_seconds"],
+    })
 
 
-def _connect(path):
+@contextmanager
+def _transaction(path):
     target = Path(path) if path is not None else default_store_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(target), timeout=5.0)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=5000")
-    connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version > SCHEMA_VERSION:
-        connection.close()
-        raise RuntimeError("EVIDENCE_SCHEMA_NEWER_THAN_APPLICATION")
-    connection.executescript("""
-        CREATE TABLE IF NOT EXISTS runs (
-            run_id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            app_version TEXT NOT NULL,
-            usage_mode TEXT NOT NULL,
-            rounds INTEGER NOT NULL,
-            candidates_json TEXT NOT NULL,
-            plan_json TEXT NOT NULL,
-            status TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pairs (
-            run_id TEXT NOT NULL,
-            pair_id TEXT NOT NULL,
-            concurrency INTEGER NOT NULL,
-            round_number INTEGER,
-            retest INTEGER NOT NULL,
-            context_id TEXT,
-            valid INTEGER NOT NULL,
-            measurement_valid INTEGER NOT NULL,
-            environment_verified INTEGER NOT NULL,
-            load_window_verified INTEGER NOT NULL,
-            reasons_json TEXT NOT NULL,
-            speedup REAL,
-            latency_ratio REAL,
-            baseline_mbps REAL,
-            candidate_mbps REAL,
-            baseline_ttfb_ms REAL,
-            candidate_ttfb_ms REAL,
-            baseline_success INTEGER NOT NULL,
-            baseline_planned INTEGER NOT NULL,
-            candidate_success INTEGER NOT NULL,
-            candidate_planned INTEGER NOT NULL,
-            http_version TEXT,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (run_id, pair_id, concurrency),
-            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_pairs_context_candidate
-            ON pairs(context_id, concurrency, created_at);
-    """)
-    connection.execute("PRAGMA user_version=1")
-    connection.commit()
-    return connection, target
-
-
-def _number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
-
-
-def _safe_int(value, default=0):
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def _build_rows(result, records, run_id, created_at):
-    plan = result.get("formal_plan") or {}
-    candidates = sorted(set(result.get("candidates") or plan.get("candidates") or []))
-    rows = []
-    for pair in result.get("pairs") or []:
-        environment = pair.get("environment") or {}
-        begin = environment.get("begin_index")
-        end = environment.get("end_index")
-        start_record = records[begin] if isinstance(begin, int) and 0 <= begin < len(records) else None
-        end_record = records[end] if isinstance(end, int) and 0 <= end < len(records) else None
-        start_snapshot = start_record.get("snapshot") if isinstance(start_record, dict) else None
-        end_snapshot = end_record.get("snapshot") if isinstance(end_record, dict) else None
-        fingerprint = network_fingerprint(start_snapshot)
-        end_fingerprint = network_fingerprint(end_snapshot)
-        context_stable = fingerprint is not None and end_fingerprint == fingerprint
-        protocol = pair.get("http_version")
-        context = _context_id(result, fingerprint) if fingerprint is not None else None
-        measurement_valid = pair.get("measurement_valid") is True
-        environment_verified = pair.get("environment_verified") is True
-        load_verified = pair.get("load_window_verified") is True
-        valid = bool(pair.get("valid") is True and measurement_valid and
-                     environment_verified and load_verified and context_stable)
-        reasons = list(pair.get("reasons") or [])
-        if not context_stable:
-            reasons.append("HISTORY_NETWORK_CONTEXT_UNVERIFIED")
-        candidate = _safe_int(pair.get("concurrency"))
-        rows.append({
-            "run_id": run_id,
-            "pair_id": str(pair.get("pair_id") or "UNKNOWN"),
-            "concurrency": candidate,
-            "round_number": _safe_int(pair.get("round")),
-            "retest": int(bool(pair.get("retest"))),
-            "context_id": context,
-            "valid": int(valid),
-            "measurement_valid": int(measurement_valid),
-            "environment_verified": int(environment_verified),
-            "load_window_verified": int(load_verified),
-            "reasons_json": _json(sorted(set(str(x) for x in reasons))),
-            "speedup": pair.get("speedup") if _number(pair.get("speedup")) else None,
-            "latency_ratio": pair.get("latency_ratio") if _number(pair.get("latency_ratio")) else None,
-            "baseline_mbps": pair.get("baseline_mbps") if _number(pair.get("baseline_mbps")) else None,
-            "candidate_mbps": pair.get("candidate_mbps") if _number(pair.get("candidate_mbps")) else None,
-            "baseline_ttfb_ms": pair.get("baseline_ttfb_ms") if _number(pair.get("baseline_ttfb_ms")) else None,
-            "candidate_ttfb_ms": pair.get("candidate_ttfb_ms") if _number(pair.get("candidate_ttfb_ms")) else None,
-            "baseline_success": _safe_int(pair.get("baseline_success")),
-            "baseline_planned": max(1, _safe_int(pair.get("baseline_planned"), 1)),
-            "candidate_success": _safe_int(pair.get("candidate_success")),
-            "candidate_planned": max(1, _safe_int(pair.get("candidate_planned"), candidate or 1)),
-            "http_version": protocol,
-            "created_at": created_at,
-        })
-    return rows, candidates
-
-
-def _history_summary(rows, concurrency, rounds, current_run_id, usage_mode, context_id):
-    attempted = len(rows)
-    good = []
-    comparability_invalid = False
-    for row in rows:
-        try:
-            reasons = json.loads(row["reasons_json"] or "[]")
-        except (TypeError, ValueError):
-            reasons = ["HISTORY_RECORD_CORRUPT"]
-        if any(reason in COMPARABILITY_REASONS for reason in reasons):
-            comparability_invalid = True
-        if (row["valid"] and _number(row["speedup"]) and row["speedup"] > 0 and
-                _number(row["latency_ratio"]) and row["latency_ratio"] > 0):
-            good.append(row)
-        elif row["valid"]:
-            comparability_invalid = True
-    protocols = {row["http_version"] for row in good if row["http_version"]}
-    if len(protocols) > 1 or any(row["valid"] and not row["http_version"] for row in rows):
-        comparability_invalid = True
-    ratios = [float(row["speedup"]) for row in good]
-    rates = [float(row["candidate_mbps"]) for row in good if _number(row["candidate_mbps"]) and row["candidate_mbps"] > 0]
-    baseline_rates = [float(row["baseline_mbps"]) for row in good if _number(row["baseline_mbps"]) and row["baseline_mbps"] > 0]
-    latency_values = [float(row["latency_ratio"]) for row in good]
-    successful = len(good)
-    planned_requests = sum(max(0, _safe_int(row["candidate_planned"])) for row in rows)
-    successful_requests = sum(max(0, _safe_int(row["candidate_success"])) for row in rows)
-    completion = successful / attempted if attempted else 0.0
-    request_rate = successful_requests / planned_requests if planned_requests else 0.0
-    spread = max(ratios) / min(ratios) if ratios else None
-    mean = statistics.mean(ratios) if ratios else 0
-    cv = statistics.pstdev(ratios) / mean if len(ratios) > 1 and mean else (0.0 if ratios else None)
-    valid_runs = {row["run_id"] for row in good}
-    all_runs = {row["run_id"] for row in rows}
-    current_valid = sum(row["run_id"] == current_run_id for row in good)
-    reasons = []
-    if comparability_invalid:
-        reasons.append("COMPARABILITY_EVIDENCE_INVALID")
-    if successful < rounds:
-        reasons.append("INSUFFICIENT_VALID_PAIRS")
-    if completion < .75 or request_rate < .75:
-        reasons.append("LOW_COMPLETION_RATE")
-    if ratios and (spread > 2 or (len(ratios) > 1 and cv > .35)):
-        reasons.append("HIGH_PAIRED_VARIATION")
-    if len(valid_runs) < 2:
-        reasons.append("INSUFFICIENT_INDEPENDENT_RUNS")
-    if current_valid < 1:
-        reasons.append("CURRENT_RUN_NOT_CONFIRMED")
-    if usage_mode != "controlled":
-        reasons.append("SHARED_MODE_OBSERVATION_ONLY")
-    median_ratio = statistics.median(ratios) if ratios else None
-    latency = statistics.median(latency_values) if latency_values else None
-    votes = sum(value >= 1.10 for value in ratios)
-    reliability = min(completion, request_rate)
-    score = median_ratio ** .65 * reliability ** .25 * min(1, latency) ** .10 if median_ratio and latency and reliability else None
-    eligible = not reasons
-    if "COMPARABILITY_EVIDENCE_INVALID" in reasons:
-        state = "IRRECOVERABLE_COMPARABILITY"
-    elif spread is not None and spread > 2:
-        state = "IRRECOVERABLE_SPREAD"
-    elif usage_mode != "controlled":
-        state = "OBSERVATIONAL_ONLY"
-    elif eligible and median_ratio is not None:
-        if median_ratio >= 1.10 and votes >= math.ceil(2 * successful / 3) and score is not None and score > 1:
-            state = "SUPPORTED_GAIN"
-        elif median_ratio < 1.10 and successful - votes >= math.ceil(2 * successful / 3):
-            state = "SUPPORTED_NO_GAIN"
-        else:
-            state = "NEEDS_MORE_EVIDENCE"
-    else:
-        state = "NEEDS_MORE_EVIDENCE"
-    return {
-        "concurrency": concurrency,
-        "context_id": context_id,
-        "history_run_count": len(all_runs),
-        "history_valid_run_count": len(valid_runs),
-        "current_run_valid_pairs": current_valid,
-        "planned_rounds": rounds,
-        "attempted_rounds": attempted,
-        "successful_rounds": successful,
-        "paired_rounds": successful,
-        "pair_completion_rate": completion,
-        "success_rate": request_rate,
-        "success_requests": successful_requests,
-        "planned_requests": planned_requests,
-        "median_mbps": statistics.median(rates) if rates else None,
-        "paired_baseline_median_mbps": statistics.median(baseline_rates) if baseline_rates else None,
-        "paired_median_speedup": median_ratio,
-        "paired_median_speedup_pct": (median_ratio - 1) * 100 if median_ratio is not None else None,
-        "variation_ratio": spread,
-        "paired_cv": cv,
-        "paired_latency_ratio": latency,
-        "material_gain_pairs": votes,
-        "composite_score": score,
-        "eligible": eligible,
-        "quality_reasons": sorted(set(reasons)),
-        "evidence_state": state,
-    }
-
-
-def persist_and_analyze(result, records, path=None, app_version="0.3.8"):
-    """Append one run in a single SQLite transaction and evaluate only identical contexts."""
-    pairs = result.get("pairs") or []
-    if not pairs:
-        return {
-            "history_store": {"status": "NO_PAIRS", "stored_pairs": 0, "database": "evidence.sqlite3"},
-            "historical_evidence": [],
-            "history_cross_run_ready": False,
-        }
-    run_id = uuid.uuid4().hex
-    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    records = records if isinstance(records, list) else []
-    rows, candidates = _build_rows(result, records, run_id, created_at)
-    rounds = _safe_int(result.get("rounds"), 3)
-    plan = result.get("formal_plan") or {}
-    usage_mode = str(result.get("usage_mode") or "unknown")
-    connection = None
-    try:
-        connection, target = _connect(path)
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "INSERT INTO runs VALUES (?,?,?,?,?,?,?,?)",
-            (run_id, created_at, str(app_version), usage_mode, rounds, _json(candidates), _json(plan),
-             str(result.get("status") or "Unknown")))
-        columns = (
-            "run_id,pair_id,concurrency,round_number,retest,context_id,valid,measurement_valid,"
-            "environment_verified,load_window_verified,reasons_json,speedup,latency_ratio,baseline_mbps,"
-            "candidate_mbps,baseline_ttfb_ms,candidate_ttfb_ms,baseline_success,baseline_planned,"
-            "candidate_success,candidate_planned,http_version,created_at"
-        )
-        placeholders = ",".join("?" for _ in range(23))
-        values = [[row[key] for key in columns.split(",")] for row in rows]
-        connection.executemany("INSERT INTO pairs (" + columns + ") VALUES (" + placeholders + ")", values)
-        connection.commit()
-
-        summaries = []
-        for candidate in (c for c in candidates if c > 1):
-            contexts = {row["context_id"] for row in rows
-                        if row["concurrency"] == candidate and row["context_id"]}
-            if len(contexts) != 1:
-                state = "CONTEXT_SPLIT" if len(contexts) > 1 else "UNVERIFIED_CONTEXT"
-                summaries.append({
-                    "concurrency": candidate, "context_id": None, "history_run_count": 0,
-                    "history_valid_run_count": 0, "current_run_valid_pairs": 0,
-                    "attempted_rounds": 0, "paired_rounds": 0, "eligible": False,
-                    "quality_reasons": ["MULTIPLE_NETWORK_CONTEXTS" if len(contexts) > 1 else "NETWORK_CONTEXT_UNAVAILABLE"],
-                    "evidence_state": state,
-                })
-                continue
-            context = next(iter(contexts))
-            history_rows = connection.execute(
-                "SELECT p.*, r.usage_mode FROM pairs p JOIN runs r ON r.run_id=p.run_id "
-                "WHERE p.context_id=? AND p.concurrency=? ORDER BY p.created_at,p.run_id,p.pair_id",
-                (context, candidate)).fetchall()
-            modes = {row["usage_mode"] for row in history_rows}
-            mode = next(iter(modes)) if len(modes) == 1 else "mixed"
-            summaries.append(_history_summary(history_rows, candidate, rounds, run_id, mode, context))
-        expected = {candidate for candidate in candidates if candidate > 1}
-        cross_run_ready = bool(expected and {row.get("concurrency") for row in summaries} == expected and
-                               all(row.get("evidence_state") in ("SUPPORTED_GAIN", "SUPPORTED_NO_GAIN")
-                                   for row in summaries))
-        return {
-            "history_store": {
-                "status": "SAVED",
-                "run_id": run_id,
-                "stored_pairs": len(rows),
-                "contextual_pairs": sum(row["context_id"] is not None for row in rows),
-                "database": "evidence.sqlite3",
-                "storage_scope": "per-user-local-app-data",
-                "schema_version": SCHEMA_VERSION,
-                "quality_policy_id": QUALITY_POLICY_ID,
-            },
-            "historical_evidence": summaries,
-            "history_cross_run_ready": cross_run_ready,
-        }
-    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError):
-        if connection is not None:
+    with closing(sqlite3.connect(str(target), timeout=5.0)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        # SQLite can return BUSY immediately when two fresh connections both switch journal mode.
+        deadline = time.monotonic() + 5
+        while True:
             try:
-                connection.rollback()
-            except sqlite3.Error:
-                pass
-        return {
-            "history_store": {"status": "FAILED", "stored_pairs": 0, "database": "evidence.sqlite3",
-                              "reason": "LOCAL_HISTORY_STORE_UNAVAILABLE"},
-            "historical_evidence": [],
-            "history_cross_run_ready": False,
-        }
-    finally:
-        if connection is not None:
-            connection.close()
+                db.execute("PRAGMA journal_mode=WAL").fetchone()
+                break
+            except sqlite3.OperationalError as exc:
+                if str(exc) != "database is locked" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.025)
+        db.execute("PRAGMA synchronous=FULL")
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise ValueError("EVIDENCE_SCHEMA_NEWER_THAN_APPLICATION")
+            if version == 0:
+                db.execute("""CREATE TABLE runs (
+                    run_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, app_version TEXT NOT NULL,
+                    usage_mode TEXT NOT NULL, rounds INTEGER NOT NULL, candidates_json TEXT NOT NULL,
+                    plan_json TEXT NOT NULL, status TEXT NOT NULL)""")
+                db.execute("""CREATE TABLE pairs (
+                    run_id TEXT NOT NULL, pair_id TEXT NOT NULL, concurrency INTEGER NOT NULL,
+                    round_number INTEGER, retest INTEGER NOT NULL, context_id TEXT, valid INTEGER NOT NULL,
+                    measurement_valid INTEGER NOT NULL, environment_verified INTEGER NOT NULL,
+                    load_window_verified INTEGER NOT NULL, reasons_json TEXT NOT NULL, speedup REAL,
+                    latency_ratio REAL, baseline_mbps REAL, candidate_mbps REAL, baseline_ttfb_ms REAL,
+                    candidate_ttfb_ms REAL, baseline_success INTEGER NOT NULL, baseline_planned INTEGER NOT NULL,
+                    candidate_success INTEGER NOT NULL, candidate_planned INTEGER NOT NULL, http_version TEXT,
+                    created_at TEXT NOT NULL, PRIMARY KEY (run_id,pair_id,concurrency),
+                    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE)""")
+                db.execute("CREATE INDEX idx_pairs_context_candidate ON pairs(context_id,concurrency,created_at)")
+            if version < 2:
+                # NULL marks legacy rows whose original session and admission gates cannot be verified.
+                db.execute("ALTER TABLE runs ADD COLUMN evidence_digest TEXT")
+                db.execute("ALTER TABLE runs ADD COLUMN admission_reasons TEXT")
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+
+
+def _positive(value):
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def _admission_reasons(result, plan):
+    reasons = []
+    if result.get("global_environment_guard_passed") is not True:
+        reasons.append("GLOBAL_ENVIRONMENT_UNVERIFIED")
+    if (result.get("load_scheduler_enabled") is not True or result.get("load_scheduler_available") is not True
+            or result.get("pilot_load_coverage_ok") is not True):
+        reasons.append("PILOT_LOAD_UNVERIFIED")
+    if (plan.get("pilot_attempt_count") != tuning.PILOT_COUNT or
+            plan.get("pilot_success_count") not in range(2, tuning.PILOT_COUNT + 1)):
+        reasons.append("PILOT_CALIBRATION_INSUFFICIENT")
+    candidates = result.get("candidates") or []
+    if (plan.get("frozen") is not True or not all(_positive(plan.get(k)) for k in
+            ("total_bytes", "connect_timeout_seconds", "max_time_seconds")) or
+            sorted(candidates) != sorted(plan.get("candidates") or []) or 1 not in candidates or
+            len(set(candidates)) != len(candidates) or not set(candidates) <= set(tuning.CONCURRENCY_LEVELS) or
+            result.get("rounds") not in range(2, 6) or not result.get("load_policy") or
+            result.get("parameter") != "parallel_https_requests" or not result.get("scope") or
+            result.get("design") != "sequential_adjacent_equal_work_pairs" or
+            result.get("usage_mode") not in ("shared", "controlled")):
+        reasons.append("HISTORY_CONTROLS_UNVERIFIED")
+    if result.get("blocked") is not False or result.get("status") not in ("Completed", "Incomplete"):
+        reasons.append("EXPERIMENT_BLOCKED_OR_UNAVAILABLE")
+    return reasons
+
+
+def _attempts(result):
+    pairs = list(result.get("pairs") or [])
+    finished = {(p["concurrency"], p["pair_id"]) for p in pairs}
+    partial = {}
+    for batch in result.get("batches") or []:
+        candidate, ident = batch["baseline_for"], batch["pair_id"]
+        if (candidate, ident) in finished:
+            continue
+        # A batch actually started. Keep this attempt in the denominator even if its peer never ran.
+        pair = partial.setdefault((candidate, ident), dict(
+            concurrency=candidate, pair_id=ident, round=batch["round"], retest=batch.get("retest", False),
+            reasons=["INCOMPLETE_BATCH"], baseline_success=0, candidate_success=0,
+            baseline_planned=1, candidate_planned=candidate))
+        field = "baseline_success" if batch["concurrency"] == 1 else "candidate_success"
+        pair[field] = batch.get("success", 0)
+    return pairs + list(partial.values())
+
+
+def _build_rows(result, pairs, records, exclusions):
+    run_id, stamp = result["run_id"], result["started_at_utc"]
+    fingerprints = {}
+
+    def boundary(index):
+        if type(index) is not int or not 0 <= index < len(records):
+            return None
+        if index not in fingerprints:
+            record = records[index]
+            fingerprints[index] = network_fingerprint(record.get("snapshot")) if isinstance(record, dict) else None
+        return fingerprints[index]
+
+    # The phase can identify the context of a failed attempt. Only its own two boundaries can validate it.
+    for index, record in enumerate(records):
+        if isinstance(record, dict) and (record.get("phase") == "tuning" or
+                record.get("label") in ("after_performance", "after_tuning")):
+            boundary(index)
+    rows = []
+    for pair in pairs:
+        environment = pair.get("environment") or {}
+        begin, end = environment.get("begin_index"), environment.get("end_index")
+        before, after = boundary(begin), boundary(end)
+        bracketed = bool(before and before == after and begin < end)
+        reasons = set(pair.get("reasons") or [])
+        if not bracketed:
+            reasons.add("HISTORY_NETWORK_CONTEXT_UNVERIFIED")
+        c = pair["concurrency"]
+        if c not in result["candidates"] or c == 1 or not pair.get("pair_id"):
+            raise ValueError("INVALID_PAIR_IDENTITY")
+        measured = pair.get("measurement_valid") is True
+        env_ok = pair.get("environment_verified") is True and bracketed
+        load_ok = pair.get("load_window_verified") is True
+        metrics = {key: pair.get(key) if _positive(pair.get(key)) else None for key in
+                   ("speedup", "latency_ratio", "baseline_mbps", "candidate_mbps", "baseline_ttfb_ms", "candidate_ttfb_ms")}
+        protocol = pair.get("http_version")
+        if not isinstance(protocol, str) or not protocol.strip():
+            protocol = None
+        counts = {}
+        for side, planned in (("baseline", 1), ("candidate", c)):
+            success = pair.get(side + "_success")
+            if pair.get(side + "_planned") != planned or type(success) is not int or not 0 <= success <= planned:
+                reasons.add("PAIR_IDENTITY_INVALID")
+                success = 0
+            counts[side + "_planned"] = planned
+            counts[side + "_success"] = success
+        if measured and (not all(metrics.values()) or not protocol or
+                         counts["baseline_success"] != 1 or counts["candidate_success"] != c):
+            reasons.add("PAIR_IDENTITY_INVALID")
+        rows.append(dict(run_id=run_id, created_at=stamp, pair_id=pair["pair_id"], concurrency=c,
+                         round_number=pair["round"], retest=int(bool(pair.get("retest"))),
+                         valid=int(pair.get("valid") is True and measured and env_ok and load_ok and not reasons),
+                         measurement_valid=int(measured), environment_verified=int(env_ok),
+                         load_window_verified=int(load_ok), reasons_json=_json(sorted(reasons)),
+                         http_version=protocol, **metrics, **counts))
+    networks = set(fingerprints.values()) - {None}
+    if len(networks) != 1:
+        exclusions.append("MULTIPLE_NETWORK_CONTEXTS" if networks else "NETWORK_CONTEXT_UNAVAILABLE")
+    context = _context_id(result, networks.pop()) if not exclusions else None
+    for row in rows:
+        row["context_id"] = context
+    return rows, context
+
+
+def _history_summary(db, context, candidate, rounds, run_id, mode):
+    sessions = defaultdict(list)
+    for record in db.execute(
+            "SELECT p.* FROM pairs p JOIN runs r ON r.run_id=p.run_id "
+            "WHERE p.context_id=? AND p.concurrency=? AND r.admission_reasons='[]' ORDER BY p.created_at,p.run_id,p.pair_id",
+            (context, candidate)):
+        pair = dict(record)
+        pair["pair_id"] = (pair["run_id"], pair["pair_id"])
+        pair["reasons"] = json.loads(pair["reasons_json"])
+        pair["environment_verified"] = bool(pair["environment_verified"])
+        pair["load_window_verified"] = bool(pair["load_window_verified"])
+        sessions[pair["run_id"]].append(pair)
+
+    def protocols(group):
+        return {p["http_version"] for p in group if p["http_version"]}
+
+    current_protocols = protocols(sessions.get(run_id, []))
+    # Assign protocols by whole candidate-session so an unmeasurable failure cannot disappear.
+    # Sessions with no readable protocol count as failures in the matching network/workload.
+    compatible = {rid: group for rid, group in sessions.items()
+                  if rid == run_id or not protocols(group) or protocols(group) == current_protocols}
+    pairs = [p for group in compatible.values() for p in group]
+    row = tuning.summarize_pairs(pairs, [candidate], rounds, pooled=True)[0]
+    state = tuning.evidence_state(row, rounds)
+    reasons = row["quality_reasons"]
+    valid = {rid: [p for p in group if p["valid"]] for rid, group in compatible.items()}
+    valid_runs = sum(bool(group) for group in valid.values())
+    current_valid = len(valid.get(run_id, []))
+    if len(current_protocols) != 1:
+        reasons.append("HISTORY_PROTOCOL_UNVERIFIED")
+    if valid_runs < 2:
+        reasons.append("INSUFFICIENT_INDEPENDENT_RUNS")
+    if not current_valid:
+        reasons.append("CURRENT_RUN_NOT_CONFIRMED")
+    if mode != "controlled":
+        reasons.append("SHARED_MODE_OBSERVATION_ONLY")
+    session_states = set()
+    for rid, group in valid.items():
+        if len(group) >= rounds:
+            local = tuning.summarize_pairs(compatible[rid], [candidate], rounds)[0]
+            session_states.add(tuning.evidence_state(local, rounds))
+    if SUPPORTED <= session_states:
+        reasons.append("CONFLICTING_SESSION_DIRECTION")
+    if state in SUPPORTED and valid_runs >= 2:
+        gain = state == "SUPPORTED_GAIN"
+        confirming = set()
+        for rid, group in valid.items():
+            votes = sum((p["speedup"] >= tuning.MIN_SPEEDUP) == gain for p in group)
+            if tuning.direction_supported(votes, len(group)):
+                confirming.add(rid)
+        if run_id not in confirming or len(confirming) < 2:
+            reasons.append("INDEPENDENT_DIRECTION_UNCONFIRMED")
+    if reasons:
+        row.update(eligible=False, composite_score=None)
+    if mode != "controlled":
+        state = "OBSERVATIONAL_ONLY"
+    elif state not in ("IRRECOVERABLE_SPREAD", "IRRECOVERABLE_COMPARABILITY") and (state not in SUPPORTED or reasons):
+        state = "NEEDS_MORE_EVIDENCE"
+    row.update(context_id=context, evidence_state=state, history_run_count=len(compatible),
+               history_valid_run_count=valid_runs, current_run_valid_pairs=current_valid,
+               quality_reasons=sorted(set(reasons)))
+    return row
+
+
+def _outcome(status, *, rows=(), summaries=(), ready=False, **info):
+    return {"history_store": dict(status=status, stored_pairs=len(rows), database="evidence.sqlite3", **info),
+            "historical_evidence": list(summaries), "history_cross_run_ready": ready}
+
+
+def persist_and_analyze(result, records, path=None, app_version=core.VERSION):
+    """Write once per measurement session. Evaluate and commit in the same database snapshot."""
+    try:
+        attempts = _attempts(result)
+        if not attempts:
+            return _outcome("NO_PAIRS")
+        run_id = result.get("run_id")
+        if (not isinstance(run_id, str) or len(run_id) != 32 or uuid.UUID(hex=run_id).hex != run_id
+                or not result.get("started_at_utc")):
+            return _outcome("UNVERIFIED_SESSION", reason="MISSING_MEASUREMENT_SESSION_ID")
+        plan = result.get("formal_plan") or {}
+        candidates = sorted(result.get("candidates") or [])
+        rounds, mode = result["rounds"], result["usage_mode"]
+        exclusions = _admission_reasons(result, plan)
+        rows, context = _build_rows(result, attempts, records or [], exclusions)
+        metadata = (run_id, result["started_at_utc"], str(app_version), mode, rounds, _json(candidates),
+                    _json(plan), result["status"])
+        digest = _digest([metadata, exclusions, rows])
+        with _transaction(path) as db:
+            stored = db.execute("SELECT evidence_digest FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if stored is None:
+                db.execute("INSERT INTO runs (run_id,created_at,app_version,usage_mode,rounds,candidates_json,"
+                           "plan_json,status,evidence_digest,admission_reasons) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (*metadata, digest, _json(exclusions)))
+                columns = list(rows[0])
+                db.executemany(f"INSERT INTO pairs ({','.join(columns)}) VALUES ({','.join(':'+k for k in columns)})", rows)
+            elif stored["evidence_digest"] != digest:
+                return _outcome("FAILED", reason="SESSION_ID_CONFLICT")
+            summaries = [_history_summary(db, context, c, rounds, run_id, mode)
+                         for c in candidates if c > 1] if context else []
+            ready = bool(tuning.same_protocol(summaries) and
+                         all(s["evidence_state"] in SUPPORTED for s in summaries))
+            return _outcome("SAVED" if stored is None else "ALREADY_SAVED", rows=rows, summaries=summaries,
+                            ready=ready, run_id=run_id, contextual_pairs=len(rows) if context else 0,
+                            admission_reasons=exclusions, storage_scope="per-user-local-app-data",
+                            schema_version=SCHEMA_VERSION, quality_policy_id=QUALITY_POLICY_ID)
+    except (OSError, sqlite3.Error, KeyError, ValueError, TypeError, OverflowError):
+        return _outcome("FAILED", reason="LOCAL_HISTORY_STORE_UNAVAILABLE")

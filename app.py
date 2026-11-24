@@ -19,7 +19,7 @@ class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
         self.font_family=self.configure_fonts(root)
-        root.title('自适应网络优化工具 0.3.7'); root.geometry('1050x880'); root.minsize(900,760)
+        root.title('自适应网络优化工具 '+core.VERSION); root.geometry('1050x880'); root.minsize(900,760)
         f=ttk.Frame(root,padding=22); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=(self.font_family,22,'bold')).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置',font=(self.font_family,10)).pack(anchor='w',pady=(5,16))
@@ -135,7 +135,7 @@ class App:
                     try:observer.checkpoint('after_tuning','done')
                     except (core.ProbeError,OSError,ValueError):warnings.append('无法取得并发寻优结束时网络快照。')
                     tuning_result=tuning.apply_environment_gate(tuning_result,observer.evidence('tuning'))
-                    history=evidence.persist_and_analyze(tuning_result,observer.records,app_version='0.3.8')
+                    history=evidence.persist_and_analyze(tuning_result,observer.records)
                     tuning_result=tuning.apply_history_evidence(tuning_result,history)
                     tuning_result['monitoring_overhead']=observer.overhead(tuning_result.get('pilots',[])+tuning_result.get('batches',[]))
                     tuning_result['load_monitor']=observer.load_evidence()
@@ -147,7 +147,7 @@ class App:
                 env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,load_monitor=observer.load_evidence(),ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
                 core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
-                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.8','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':core.VERSION,'snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=core.new_report_directory()
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
@@ -181,9 +181,12 @@ class App:
                     tune=result.get('tuning_experiment',{})
                     self.log('并发寻优：'+(str(tune.get('selected_concurrency'))+' 路' if tune.get('recommendation_allowed') else tune.get('decision_note','未执行')))
                     self.log('并发配对补测：'+str(tune.get('retest_status','未执行'))+'；综合得分：'+str(tune.get('composite_score')))
-                    local_certified=[str(x.get('concurrency')) for x in tune.get('candidate_local_evidence',[]) if x.get('local_evidence_certified')]
-                    self.log('局部证据独立认证：'+('、'.join(local_certified)+' 路' if local_certified else '暂无候选通过'))
-                    self.log('历史证据库：'+str(tune.get('history_store',{}).get('status','未执行'))+'；跨次认证：'+str(tune.get('history_comparison_ready',False)))
+                    for row in tune.get('candidate_local_evidence',[]):
+                        verdict=tuning.evidence_label(row) if row['local_evidence_certified'] else '局部认证未通过'
+                        self.log(f"{row['concurrency']} 路对比 1 路：{verdict}，有效配对 {row['valid_pairs']}/{row['attempted_pairs']}。")
+                    self.log('历史证据库：'+tuning.history_store_label(tune.get('history_store',{})))
+                    for row in tune.get('historical_evidence',[]):
+                        self.log(f"跨次验证 {row['concurrency']} 路：{tuning.evidence_label(row)}，{row['history_valid_run_count']} 次运行提供了 {row['paired_rounds']} 个有效配对。")
                     self.log('下载质量：'+str(result['performance'].get('download_experiment',{}).get('quality',{})))
                     for i in result['performance']['icmp']:
                         self.log(f"ICMP {i['ip']}：无应答 {i['loss_percent']}%，抖动 {i['jitter_ms']} ms")
