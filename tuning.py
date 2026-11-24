@@ -65,7 +65,7 @@ def run_batch(exe,concurrency,round_number,stop,probe=None,total_bytes=AGGREGATE
     with ThreadPoolExecutor(max_workers=concurrency,thread_name_prefix='ano-tune') as pool:
         if default_probe:
             futures={pool.submit(probe,exe,DOWNLOAD_URL.format(size=size),size,size,stop,
-                                 connect_timeout=connect_timeout):(i,size)
+                                 connect_timeout=connect_timeout,max_time=MAX_TRANSFER_SECONDS):(i,size)
                      for i,size in enumerate(sizes)}
         else:
             futures={pool.submit(probe,exe,DOWNLOAD_URL.format(size=size),size,size,stop):(i,size)
@@ -144,7 +144,11 @@ def evaluate_pair(baseline,challenger,plan):
     reasons=[]
     if baseline.get('concurrency')!=1 or challenger.get('concurrency') not in plan['candidates'] or challenger.get('concurrency')==1:
         reasons.append('PAIR_IDENTITY_INVALID')
-    if not baseline.get('pair_id') or baseline.get('pair_id')!=challenger.get('pair_id'):
+    if (not baseline.get('pair_id') or baseline.get('pair_id')!=challenger.get('pair_id') or
+        baseline.get('round')!=challenger.get('round') or baseline.get('baseline_for')!=challenger.get('concurrency') or
+        challenger.get('baseline_for')!=challenger.get('concurrency') or
+        not isinstance(baseline.get('sequence'),int) or not isinstance(challenger.get('sequence'),int) or
+        abs(baseline['sequence']-challenger['sequence'])!=1):
         reasons.append('PAIR_IDENTITY_INVALID')
     for b in (baseline,challenger):
         if b.get('expected_bytes')!=plan['total_bytes'] or b.get('connect_timeout_seconds')!=plan['connect_timeout_seconds'] or b.get('max_time_seconds')!=plan['max_time_seconds']:
@@ -153,7 +157,11 @@ def evaluate_pair(baseline,challenger,plan):
             b.get('success')!=b.get('concurrency') or b.get('planned')!=b.get('concurrency') or
             len(b.get('worker_rows',[]))!=b.get('concurrency') or not _positive(b.get('aggregate_mbps'))):
             reasons.append('INCOMPLETE_BATCH')
-    if not _batch_protocol(baseline) or _batch_protocol(baseline)!=_batch_protocol(challenger):
+        else:
+            sizes=split_sizes(plan['total_bytes'],b['concurrency'])
+            if not all(_valid(w,size) for w,size in zip(b['worker_rows'],sizes)):
+                reasons.append('INCOMPLETE_BATCH')
+    if 'INCOMPLETE_BATCH' not in reasons and (not _batch_protocol(baseline) or _batch_protocol(baseline)!=_batch_protocol(challenger)):
         reasons.append('HTTP_PROTOCOL_MISMATCH_OR_MISSING')
     bt,ct=baseline.get('ttfb_median_ms'),challenger.get('ttfb_median_ms')
     if not _positive(bt) or not _positive(ct):reasons.append('TTFB_MISSING')

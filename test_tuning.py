@@ -70,6 +70,10 @@ class TuningTests(unittest.TestCase):
         r=self.run_fake();a,b=sorted(r['batches'][:2],key=lambda x:x['concurrency'])
         b=dict(b,expected_bytes=b['expected_bytes']*2)
         self.assertIn('CONTROL_VARIABLE_MISMATCH',t.evaluate_pair(a,b,r['formal_plan'])['reasons'])
+    def test_reject_nonadjacent_pair(self):
+        r=self.run_fake();a,b=sorted(r['batches'][:2],key=lambda x:x['concurrency'])
+        b=dict(b,sequence=b['sequence']+10)
+        self.assertIn('PAIR_IDENTITY_INVALID',t.evaluate_pair(a,b,r['formal_plan'])['reasons'])
     def test_reject_mismatched_timeout_and_protocol(self):
         r=self.run_fake();a,b=sorted(r['batches'][:2],key=lambda x:x['concurrency'])
         b=dict(b,connect_timeout_seconds=10,worker_rows=[dict(w,http_version='1.1') for w in b['worker_rows']])
@@ -101,6 +105,7 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(r['retest_status'],'Completed');self.assertEqual(len(r['pairs']),4)
         self.assertEqual(sum(p['valid'] for p in r['pairs']),3)
         self.assertEqual(r['summary'][0]['pair_completion_rate'],.75)
+        self.assertTrue(r['summary'][0]['eligible'])
     def test_rate_limit_stops_pilot(self):
         def blocked(*a,**kw):return dict(fake_batch(*a,**kw),http_blocked=True)
         r=self.run_fake(blocked);self.assertEqual(r['status'],'Blocked');self.assertEqual(r['batches'],[])
