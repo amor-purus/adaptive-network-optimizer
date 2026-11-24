@@ -15,5 +15,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python -m py_compile core.py app.py validity.py performance.py test_core.py test_validity.py test_performance.py adaptive.py test_adaptive.py
+      - run: python -m py_compile core.py app.py validity.py performance.py test_core.py test_validity.py test_performance.py adaptive.py test_adaptive.py monitor.py test_monitor.py
       - run: python -m unittest -v

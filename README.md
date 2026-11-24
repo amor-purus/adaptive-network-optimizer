@@ -1,6 +1,6 @@
 # 自适应网络优化工具（Adaptive Network Optimizer）
 
-**v0.2.1 · Windows 11 · 简体中文 · 只读测试原型**
+**v0.2.2 · Windows 11 · 简体中文 · 只读测试原型**
 
 不依赖第三方 Python 库，不需要管理员权限，不修改注册表、DNS、MTU、防火墙、代理或 TCP 参数。
 
@@ -61,3 +61,12 @@
 - curl 失败记录退出码、阶段原始计时、已接收字节和分类；仅完整成功样本计入速度。TCP 记录异常类型、errno、winerror；ICMP 保留异常类型、HResult、可用的 socket 错误码，异常样本不纳入无应答率；IPv6 ICMP 不可用仍不等于丢包。
 - 正式下载质量要求成功数不少于设定轮数、完成率至少 80%、成功速度最大值不超过最小值两倍、样本大小及 HTTP 版本一致。阈值为保守工程策略，非统计置信保证；即使通过也仅是候选基线，不自动调参。
 - 未改变系统设置，不保证识别代理实际节点或故障根因。真实网络和 Windows GUI 仍需实机验收。
+
+## v0.2.2：动态网络环境感知
+
+- DNS 与性能实验期间每隔约 15 秒采集一次配置，最多 120 次周期采样，另保留三个阶段快照；采样串行、有超时，实际间隔包含采集耗时。记录 UTC 偏移时间、单调时钟秒数及采集耗时。监测失败、采样间隙和代理内部变化仍可能影响判断。
+- 采集 AutomaticMetric、Get-NetAdapter 链路速率（含可用收发速率）、netsh WLAN 信号及收发协商速率；无线仅解析中英日常见字段，权限不足、未连接或未知语言时标记不可用。不保存 SSID、BSSID、MAC、无线配置文件或原始 netsh 输出。Windows 可能要求位置权限；工具不修改或绕过权限。链路速率并非互联网带宽。
+- 按接口索引/地址族及路由身份逐字段差分，记录观测时间区间；启用自动跃点数时的 metric 变化仅标记可能自动调整，不证明链路速率造成变化或修改者身份。链路遥测不作为配置签名字段。阶段内观察到配置变化或快照缺失时拒绝 DNS 推荐或性能基线（即使首尾恢复）。
+- IPv6 诊断统计 WSAEACCES 10013，保留 ICMP NativeErrorCode，并读取防火墙配置、IPv6 网卡绑定和地址状态计数；不读取安全事件日志、不修改规则、不确定具体拦截组件。报告包含本地网络信息，分享前检查。
+- JSON 增加 environment_monitor；HTML 增加差分和时间线，另导出 environment_changes.csv、adapter_link_timeline.csv、wlan_timeline.csv。周期采集会增加少量系统负载，不能证明采样间隙不变；仍不进行自动调参。
+- 参考 Microsoft Learn：Get-NetIPInterface、Get-NetAdapter、Get-NetFirewallProfile、Windows Sockets Error Codes。

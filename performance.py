@@ -103,7 +103,7 @@ def icmp_probe(ip,stop,rounds=5):
     core.check_cancel(stop)
     ip=str(ipaddress.ip_address(ip))
     # .NET Ping status avoids localized ping.exe text parsing.
-    script="$p=New-Object System.Net.NetworkInformation.Ping; try {$r=@(1..%d | ForEach-Object {try {$x=$p.Send('%s',1200); @{status=$x.Status.ToString();ms=if($x.Status -eq 'Success'){$x.RoundtripTime}else{$null}}}catch{$e=$_.Exception; while($e.InnerException){$e=$e.InnerException}; @{status='Exception';ms=$null;error_type=$e.GetType().FullName;hresult=$e.HResult;socket_error=if($e -is [System.Net.Sockets.SocketException]){$e.NativeErrorCode}else{$null}}}}); ConvertTo-Json -InputObject $r -Compress}finally{$p.Dispose()}"%(rounds,ip)
+    script="$p=New-Object System.Net.NetworkInformation.Ping; try {$r=@(1..%d | ForEach-Object {try {$x=$p.Send('%s',1200); @{status=$x.Status.ToString();ms=if($x.Status -eq 'Success'){$x.RoundtripTime}else{$null}}}catch{$e=$_.Exception; while($e.InnerException){$e=$e.InnerException}; @{status='Exception';ms=$null;error_type=$e.GetType().FullName;hresult=$e.HResult;socket_error=if($e -is [System.Net.Sockets.SocketException]){$e.NativeErrorCode}else{$null};native_error=if($e -is [System.ComponentModel.Win32Exception]){$e.NativeErrorCode}else{$null}}}}); ConvertTo-Json -InputObject $r -Compress}finally{$p.Dispose()}"%(rounds,ip)
     try:
         samples=core.run_powershell(script)
         if not isinstance(samples,list) or len(samples)!=rounds:raise ValueError()

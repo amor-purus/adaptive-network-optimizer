@@ -12,11 +12,12 @@ import uuid
 import core
 import validity
 import performance
+import monitor
 
 class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
-        root.title('自适应网络优化工具 0.2.1'); root.geometry('950x800'); root.minsize(760,660)
+        root.title('自适应网络优化工具 0.2.2'); root.geometry('950x800'); root.minsize(760,660)
         f=ttk.Frame(root,padding=20); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=('Microsoft YaHei UI',20)).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置').pack(anchor='w',pady=(4,14))
@@ -67,11 +68,11 @@ class App:
         self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.report=None
         for item in self.table.get_children():self.table.delete(item)
         def task():
-            warnings=[]; snap={}; current={}
+            warnings=[]; snap={}; current={}; observer=monitor.Monitor()
             def emit(s):self.queue.put(('progress',s))
             try:
                 emit('读取网卡、路由及 DNS 配置…')
-                try:snap=core.snapshot(); current=core.current_servers(snap)
+                try:snap=observer.checkpoint('start'); current=core.current_servers(snap); observer.start()
                 except (core.ProbeError,OSError,ValueError) as e:warnings.append('读取系统配置失败，当前 DNS 未纳入比较。')
                 for ip,names in current.items():servers[ip]=servers.get(ip,'当前 DNS')
                 if not servers:raise core.ProbeError('没有候选 DNS。')
@@ -79,9 +80,9 @@ class App:
                 rows=core.dns_benchmark(servers,domains,rounds,self.stop,emit)
                 emit('验证实验有效性并重新读取网络配置…')
                 after={}
-                try:after=core.snapshot()
+                try:after=observer.checkpoint('after_dns','performance')
                 except (core.ProbeError,OSError,ValueError):warnings.append('无法取得实验后网络快照。')
-                gate=validity.assess(rows,snap,after,current)
+                gate=monitor.apply_dns_gate(validity.assess(rows,snap,after,current),observer.evidence('dns'))
                 summary,choice,note=core.summarize_dns(rows,servers,domains,rounds,current,gate)
                 warnings.extend(gate['messages'])
                 warnings.append('VPN/代理、DoH、IPv6 DNS、分流及 CDN 可能使真实体验不同；不应仅凭 DNS 延迟变更系统。')
@@ -94,16 +95,22 @@ class App:
                     except (OSError,subprocess.SubprocessError,core.ProbeError):warnings.append('MTU 探测无法运行；DNS 和 TCP 结果仍保留。')
                 core.check_cancel(self.stop)
                 final_snap={}
-                try:final_snap=core.snapshot()
+                try:final_snap=observer.checkpoint('after_performance','done')
                 except (core.ProbeError,OSError,ValueError):warnings.append('无法取得性能实验后网络快照。')
-                base=performance.baseline(perf,after,final_snap)
+                observer.close()
+                phases=[observer.evidence('dns'),observer.evidence('performance')]
+                base=monitor.apply_baseline(performance.baseline(perf,after,final_snap),phases[1])
+                emit('读取 IPv6 绑定及防火墙配置旁证…')
+                env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
+                core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
-                data={'performance':perf,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.2.1','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                data={'environment_monitor':env,'performance':perf,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.2.2','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=Path.home()/'Downloads'/'AdaptiveNetworkOptimizer'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
             except Exception as e:self.queue.put(('error',str(e) if isinstance(e,core.ProbeError) else '测量失败：'+type(e).__name__))
-            finally:self.queue.put(('done',None))
+            finally:
+                observer.close();self.queue.put(('done',None))
         threading.Thread(target=task,daemon=True).start()
     def open_report(self):
         if self.report:os.startfile(str(self.report/'report.html'))
@@ -122,6 +129,8 @@ class App:
                     self.log('实验环境：'+result['validity']['environment']+'；'+result['validity']['scope'])
                     for h in result['performance']['https_summary']:
                         self.log(f"HTTPS {h['target']}：{h['success']}/{h['planned']}，TTFB {h['ttfb_median_ms']} ms，有效速度 {h['effective_mbps_median']} Mbps")
+                    self.log('环境时间线：'+str(len(result['environment_monitor']['timeline']))+' 个采样；配置变化 '+str(sum(len(p['changes']) for p in result['environment_monitor']['phases']))+' 项')
+                    self.log('IPv6 诊断：'+result['environment_monitor']['ipv6_diagnosis']['classification'])
                     self.log('下载质量：'+str(result['performance'].get('download_experiment',{}).get('quality',{})))
                     for i in result['performance']['icmp']:
                         self.log(f"ICMP {i['ip']}：无应答 {i['loss_percent']}%，抖动 {i['jitter_ms']} ms")

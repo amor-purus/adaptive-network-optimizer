@@ -116,7 +116,7 @@ def run_powershell(script):
     return json.loads(p.stdout.decode('utf-8-sig'))
 
 def snapshot():
-    script=r'''$a=@(Get-NetIPInterface | Where-Object {$_.ConnectionState -eq 'Connected'} | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,NlMtu,InterfaceMetric,Dhcp); $d=@(Get-DnsClientServerAddress | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,ServerAddresses); $r=@(Get-NetRoute | Where-Object {$_.DestinationPrefix -in @('0.0.0.0/0','::/0','0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')} | Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric); @{interfaces=$a;dns=$d;routes=$r}|ConvertTo-Json -Depth 5 -Compress'''
+    script=r'''$a=@(Get-NetIPInterface | Where-Object {$_.ConnectionState -eq 'Connected'} | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,NlMtu,InterfaceMetric,Dhcp,AutomaticMetric); $d=@(Get-DnsClientServerAddress | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,ServerAddresses); $r=@(Get-NetRoute | Where-Object {$_.DestinationPrefix -in @('0.0.0.0/0','::/0','0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')} | Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric); $ad=@();$ast='Measured';try{$ad=@(Get-NetAdapter | Select-Object Name,ifIndex,Status,LinkSpeed,ReceiveLinkSpeed,TransmitLinkSpeed,MediaConnectionState)}catch{$ast='Unavailable'}; @{interfaces=$a;dns=$d;routes=$r;adapters=$ad;adapter_status=$ast}|ConvertTo-Json -Depth 5 -Compress'''
     return run_powershell(script)
 
 def current_servers(snap):
@@ -212,6 +212,10 @@ def save_report(directory,data):
         import performance
         performance.write_csvs(root,data['performance'])
         perf_html=performance.report_html(data['performance'],data.get('performance_baseline',{}))
+    if 'environment_monitor' in data:
+        import monitor
+        monitor.write_csvs(root,data['environment_monitor'])
+        perf_html+=monitor.report_html(data['environment_monitor'])
     esc=lambda x:html.escape(str(x)); s=data['dns_summary']; choice=data['recommendation']
     table='<table><tr><th>DNS</th><th>成功/计划</th><th>中位 ms</th><th>P95 ms</th><th>当前配置</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(x)+'</td>' for x in (r['name']+' '+r['server'],f"{r['success']}/{r['planned']}",r['median_ms'],r['p95_ms'],r['current']))+'</tr>' for r in s)+'</table>'
     validity=data.get('validity',{}); gate=validity.get('recommendation_allowed') is True
