@@ -1,6 +1,6 @@
 # 自适应网络优化工具（Adaptive Network Optimizer）
 
-**v0.2.0 · Windows 11 · 简体中文 · 只读测试原型**
+**v0.2.1 · Windows 11 · 简体中文 · 只读测试原型**
 
 不依赖第三方 Python 库，不需要管理员权限，不修改注册表、DNS、MTU、防火墙、代理或 TCP 参数。
 
@@ -54,3 +54,10 @@
 - RFC 1035: https://www.rfc-editor.org/rfc/rfc1035
 - Windows DNS 配置读取: https://learn.microsoft.com/powershell/module/dnsclient/get-dnsclientserveraddress
 - Windows 路由读取: https://learn.microsoft.com/powershell/module/nettcpip/get-netroute
+
+## v0.2.1：自适应采样与失败证据
+
+- 下载先进行 128 KiB 预探测，按实测速率选择 64 KiB 至用户上限的固定样本，预探测不参与正式统计。正式样本最多补测两次；阶段预算 210 秒，计划正文预算为 128 KiB + (轮数 + 2) × 上限，非硬流量上限。
+- curl 失败记录退出码、阶段原始计时、已接收字节和分类；仅完整成功样本计入速度。TCP 记录异常类型、errno、winerror；ICMP 保留异常类型、HResult、可用的 socket 错误码，异常样本不纳入无应答率；IPv6 ICMP 不可用仍不等于丢包。
+- 正式下载质量要求成功数不少于设定轮数、完成率至少 80%、成功速度最大值不超过最小值两倍、样本大小及 HTTP 版本一致。阈值为保守工程策略，非统计置信保证；即使通过也仅是候选基线，不自动调参。
+- 未改变系统设置，不保证识别代理实际节点或故障根因。真实网络和 Windows GUI 仍需实机验收。

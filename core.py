@@ -163,15 +163,16 @@ def dns_benchmark(servers,domains,rounds,stop,emit=lambda _:None,probe=dns_probe
     return rows
 
 def tcp_probe(ip,stop,rounds=5):
-    rows=[]; ip=str(ipaddress.ip_address(ip))
+    rows=[]; errors=[]; ip=str(ipaddress.ip_address(ip))
     for _ in range(rounds):
         check_cancel(stop); start=time.monotonic()
         try:
             with socket.create_connection((ip,443),timeout=1.5): pass
-            rows.append(round((time.monotonic()-start)*1000,3))
-        except OSError: rows.append(None)
+            rows.append(round((time.monotonic()-start)*1000,3)); errors.append(None)
+        except OSError as e:
+            rows.append(None); errors.append({"type":type(e).__name__,"errno":e.errno,"winerror":getattr(e,"winerror",None)})
     valid=[x for x in rows if x is not None]
-    return {'ip':ip,'port':443,'samples_ms':rows,'success':len(valid),'attempted':len(rows),'median_ms':round(statistics.median(valid),3) if valid else None}
+    return {'ip':ip,'port':443,'samples_ms':rows,'errors':errors,'success':len(valid),'attempted':len(rows),'median_ms':round(statistics.median(valid),3) if valid else None}
 
 def ping_df(ip,payload):
     ip=str(ipaddress.IPv4Address(ip))
