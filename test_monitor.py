@@ -122,6 +122,20 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(e['tuning_telemetry_acceptable'])
         self.assertEqual(len(e['tuning_radio_assessment']['cumulative_rate_drops']),1)
 
+    def test_window_brackets_and_local_signal_policy(self):
+        def full(label,n,signal):
+            s=copy.deepcopy(BASE);s.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',MediaConnectionState=1,LinkSpeed='866.7 Mbps')])
+            return dict(label=label,elapsed_s=n,capture_start_s=n,capture_end_s=n+1,observed_at='test',
+                        snapshot=s,wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=signal,rx_mbps=866.7,tx_mbps=866.7)]))
+        rs=[full('pilot',0,92),full('begin',10,99),full('periodic',15,98),full('end',20,99)]
+        e=m.window_evidence(rs,1,3,11,19)
+        self.assertTrue(e['verified']);self.assertTrue(e['bracketed'])
+        self.assertFalse(m.window_evidence(rs,0,3,11,19)['verified'])
+        self.assertFalse(m.window_evidence(rs,1,3,10,19)['verified'])
+        self.assertFalse(m.window_evidence(rs,1,3,11,21)['verified'])
+        self.assertFalse(m.window_evidence(rs,None,3,11,19)['verified'])
+        rs[2]['wlan']['interfaces'][0]['signal_percent']=90
+        self.assertFalse(m.window_evidence(rs,1,3,11,19)['verified'])
     def test_exports(self):
         env=dict(timeline=[rec('start',BASE,0)],phases=[],ipv6_diagnosis={'note':'<script>'})
         with tempfile.TemporaryDirectory() as d:
