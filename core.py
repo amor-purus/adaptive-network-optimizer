@@ -116,7 +116,7 @@ def run_powershell(script):
     return json.loads(p.stdout.decode('utf-8-sig'))
 
 def snapshot():
-    script=r'''$a=@(Get-NetIPInterface | Where-Object {$_.ConnectionState -eq 'Connected'} | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,NlMtu,InterfaceMetric,Dhcp); $d=@(Get-DnsClientServerAddress | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,ServerAddresses); $r=@(Get-NetRoute | Where-Object {$_.DestinationPrefix -in @('0.0.0.0/0','::/0')} | Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric); @{interfaces=$a;dns=$d;routes=$r}|ConvertTo-Json -Depth 5 -Compress'''
+    script=r'''$a=@(Get-NetIPInterface | Where-Object {$_.ConnectionState -eq 'Connected'} | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,NlMtu,InterfaceMetric,Dhcp); $d=@(Get-DnsClientServerAddress | Select-Object InterfaceIndex,InterfaceAlias,AddressFamily,ServerAddresses); $r=@(Get-NetRoute | Where-Object {$_.DestinationPrefix -in @('0.0.0.0/0','::/0','0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')} | Select-Object InterfaceIndex,DestinationPrefix,NextHop,RouteMetric); @{interfaces=$a;dns=$d;routes=$r}|ConvertTo-Json -Depth 5 -Compress'''
     return run_powershell(script)
 
 def current_servers(snap):
@@ -133,12 +133,14 @@ def current_servers(snap):
 def percentile(values,p):
     return sorted(values)[max(0,math.ceil(len(values)*p)-1)]
 
-def summarize_dns(rows,servers,domains,rounds,current):
+def summarize_dns(rows,servers,domains,rounds,current,validity=None):
+    allowed=bool(validity and validity.get('recommendation_allowed') is True)
     summary=[]; required=len(domains)*rounds
     for ip,label in servers.items():
         rs=[r for r in rows if r['server']==ip]; good=[r['ms'] for r in rs if r['status']=='OK']
-        summary.append({'server':ip,'name':label,'current':ip in current,'attempted':len(rs),'planned':required,'success':len(good),'median_ms':round(statistics.median(good),3) if good else None,'p95_ms':round(percentile(good,.95),3) if good else None,'eligible':len(rs)==required and len(good)==required})
+        summary.append({'server':ip,'name':label,'current':ip in current,'attempted':len(rs),'planned':required,'success':len(good),'median_ms':round(statistics.median(good),3) if good else None,'p95_ms':round(percentile(good,.95),3) if good else None,'sample_complete':len(rs)==required and len(good)==required,'eligible':allowed and len(rs)==required and len(good)==required})
     if len(rows)!=required*len(servers): return summary,None,'测试未完成，不推荐变更。'
+    if not allowed: return summary,None,'实验有效性未通过；保留原始观测，不推荐 DNS 变更。'
     valid=[r for r in summary if r['eligible']]
     if not valid: return summary,None,'没有全部成功的候选 DNS。'
     best=min(valid,key=lambda r:(r['median_ms'],r['p95_ms']))
@@ -206,8 +208,11 @@ def save_report(directory,data):
             else: f.write('status\nno_data\n')
     esc=lambda x:html.escape(str(x)); s=data['dns_summary']; choice=data['recommendation']
     table='<table><tr><th>DNS</th><th>成功/计划</th><th>中位 ms</th><th>P95 ms</th><th>当前配置</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(x)+'</td>' for x in (r['name']+' '+r['server'],f"{r['success']}/{r['planned']}",r['median_ms'],r['p95_ms'],r['current']))+'</tr>' for r in s)+'</table>'
-    valid=[r for r in s if r['eligible']]; top=max((r['median_ms'] for r in valid),default=1) or 1
+    validity=data.get('validity',{}); gate=validity.get('recommendation_allowed') is True
+    if not gate: choice=None
+    validity_text=esc('；'.join(validity.get('messages',[])) or ('未发现已知干扰迹象，不代表已证明直连。' if gate else '实验有效性未通过。'))
+    valid=[r for r in s if gate and r['eligible']]; top=max((r['median_ms'] for r in valid),default=1) or 1
     bars=''.join('<p>'+esc(r['name'])+' '+esc(r['server'])+' — '+str(r['median_ms'])+' ms</p><div style="height:12px;background:#285eb3;width:%.2f%%"></div>'%(100*r['median_ms']/top) for r in valid)
-    details=esc(json.dumps({'tcp':data['tcp'],'mtu':data['mtu'],'warnings':data['warnings']},ensure_ascii=False,indent=2))
-    (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font:16px/1.6 system-ui;max-width:1000px;margin:32px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}pre{white-space:pre-wrap}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><p>延迟越低越好，仅完整成功的候选绘图。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre><p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
+    details=esc(json.dumps({'tcp':data['tcp'],'mtu':data['mtu'],'warnings':data['warnings'],'validity':data.get('validity',{})},ensure_ascii=False,indent=2))
+    (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font:16px/1.6 system-ui;max-width:1000px;margin:32px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}pre{white-space:pre-wrap}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><h2>实验有效性</h2><p>'+esc(validity.get('environment','environment_unverified'))+'：'+validity_text+'</p><p>下表为原始观测；仅通过有效性检查且完整成功的候选绘图。TCP/MTU 仅代表当前实际路径。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre><p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
     return root

@@ -10,11 +10,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import uuid
 import core
+import validity
 
 class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
-        root.title('自适应网络优化工具 0.1.0'); root.geometry('850x700'); root.minsize(680,580)
+        root.title('自适应网络优化工具 0.1.1'); root.geometry('850x700'); root.minsize(680,580)
         f=ttk.Frame(root,padding=20); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=('Microsoft YaHei UI',20)).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置').pack(anchor='w',pady=(4,14))
@@ -68,8 +69,13 @@ class App:
                 if not servers:raise core.ProbeError('没有候选 DNS。')
                 if len(servers)>20:raise core.ProbeError('候选超过 20 个，停止以限制请求。')
                 rows=core.dns_benchmark(servers,domains,rounds,self.stop,emit)
-                summary,choice,note=core.summarize_dns(rows,servers,domains,rounds,current)
-                if not current: warnings.append('未取得当前 IPv4 DNS 基线，推荐仅表示候选中的较优者。')
+                emit('验证实验有效性并重新读取网络配置…')
+                after={}
+                try:after=core.snapshot()
+                except (core.ProbeError,OSError,ValueError):warnings.append('无法取得实验后网络快照。')
+                gate=validity.assess(rows,snap,after,current)
+                summary,choice,note=core.summarize_dns(rows,servers,domains,rounds,current,gate)
+                warnings.extend(gate['messages'])
                 warnings.append('VPN/代理、DoH、IPv6 DNS、分流及 CDN 可能使真实体验不同；不应仅凭 DNS 延迟变更系统。')
                 emit('测试 IPv4 / IPv6 TCP 443 连接…')
                 tcp=[core.tcp_probe(ip,self.stop) for ip in ('1.1.1.1','2606:4700:4700::1111')]
@@ -78,7 +84,7 @@ class App:
                     try:mt=core.mtu_probe(target,self.stop,emit)
                     except (OSError,subprocess.SubprocessError,core.ProbeError):warnings.append('MTU 探测无法运行；DNS 和 TCP 结果仍保留。')
                 core.check_cancel(self.stop)
-                data={'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'snapshot':snap,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                data={'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.1.1','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=Path.home()/'Downloads'/'AdaptiveNetworkOptimizer'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
@@ -99,6 +105,7 @@ class App:
                         self.table.insert('','end',values=(r['name'],r['server'],f"{r['success']}/{r['planned']}",r['median_ms'] if r['median_ms'] is not None else '—',r['p95_ms'] if r['p95_ms'] is not None else '—','是' if r['current'] else '否'))
                     choice=result['recommendation']; msg='推荐 DNS 候选：'+choice['server'] if choice else '无可靠 DNS 推荐'
                     self.status.set(msg); self.log(msg); self.log(result['note'])
+                    self.log('实验环境：'+result['validity']['environment']+'；'+result['validity']['scope'])
                     for t in result['tcp']:self.log(f"TCP {t['ip']}：{t['success']}/{t['attempted']}，中位 {t['median_ms']} ms")
                     if result['mtu']:self.log('MTU 估计：'+str(result['mtu']['observed_mtu'])+'；'+result['mtu']['note'])
                     for w in result['warnings']:self.log(w)

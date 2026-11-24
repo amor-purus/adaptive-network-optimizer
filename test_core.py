@@ -43,9 +43,9 @@ class Tests(unittest.TestCase):
             for s in (tcp,udp):s.shutdown();s.server_close()
     def test_recommend(self):
         servers={'a':'A','b':'B'}; rows=[dict(server=ip,status='OK',ms=ms) for ip,ms in [('a',10),('b',11)] for _ in range(3)]
-        self.assertEqual(core.summarize_dns(rows,servers,[DOMAIN],3,{'b':[]})[1]['server'],'b')
-        self.assertIsNone(core.summarize_dns(rows[:-1],servers,[DOMAIN],3,{})[1])
-        rows[0]['status']='Failed';self.assertEqual(core.summarize_dns(rows,servers,[DOMAIN],3,{})[1]['server'],'b')
+        self.assertEqual(core.summarize_dns(rows,servers,[DOMAIN],3,{'b':[]},{'recommendation_allowed':True})[1]['server'],'b')
+        self.assertIsNone(core.summarize_dns(rows[:-1],servers,[DOMAIN],3,{},{'recommendation_allowed':True})[1])
+        rows[0]['status']='Failed';self.assertEqual(core.summarize_dns(rows,servers,[DOMAIN],3,{},{'recommendation_allowed':True})[1]['server'],'b')
     def test_benchmark_rotation(self):
         rows=core.dns_benchmark({'a':'A','b':'B'},[DOMAIN],2,threading.Event(),probe=lambda *args:(5,[],'UDP'))
         self.assertEqual([r['server'] for r in rows],['a','b','b','a'])
