@@ -246,6 +246,26 @@ class TuningTests(unittest.TestCase):
         r=self.run_fake(candidates=(1,2),observer=FakeObserver(),phase_seconds=135)
         self.assertTrue(r['time_budget_exhausted']);self.assertEqual(r['batches'],[])
 
+    def test_real_monitor_integration_without_network(self):
+        import monitor
+        snap=dict(interfaces=[dict(InterfaceIndex=16,AddressFamily=2)],dns=[],routes=[],
+                  adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',MediaConnectionState=1)])
+        wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=866.7)])
+        observer=monitor.Monitor(reader=lambda:snap,wlan=lambda:wlan)
+        observer.checkpoint('after_performance','tuning')
+        with patch('tuning.run_batch',side_effect=fake_batch):
+            r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer)
+        observer.checkpoint('after_tuning','done')
+        self.assertEqual(len(r['pairs']),3)
+        for p in r['pairs']:
+            e=p['environment'];self.assertTrue(e['verified'])
+            before=observer.records[e['begin_index']];after=observer.records[e['end_index']]
+            self.assertLessEqual(before['capture_end_s'],e['started_elapsed_s'])
+            self.assertLessEqual(e['finished_elapsed_s'],after['capture_start_s'])
+        gated=t.apply_environment_gate(r,observer.evidence('tuning'))
+        self.assertEqual(gated['selected_concurrency'],2)
+        self.assertEqual(gated['environment_evidence_level'],'VERIFIED_PAIR_SCOPE')
+
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
