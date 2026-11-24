@@ -2,13 +2,12 @@
 import datetime
 import ipaddress
 import os
-from pathlib import Path
 import queue
 import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-import uuid
+import tkinter.font as tkfont
 import core
 import validity
 import performance
@@ -18,10 +17,11 @@ import tuning
 class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
-        root.title('自适应网络优化工具 0.3.5'); root.geometry('950x800'); root.minsize(760,660)
-        f=ttk.Frame(root,padding=20); f.pack(fill='both',expand=True)
-        ttk.Label(f,text='自适应网络优化工具',font=('Microsoft YaHei UI',20)).pack(anchor='w')
-        ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置').pack(anchor='w',pady=(4,14))
+        self.font_family=self.configure_fonts(root)
+        root.title('自适应网络优化工具 0.3.6'); root.geometry('1050x880'); root.minsize(900,760)
+        f=ttk.Frame(root,padding=22); f.pack(fill='both',expand=True)
+        ttk.Label(f,text='自适应网络优化工具',font=(self.font_family,22,'bold')).pack(anchor='w')
+        ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置',font=(self.font_family,10)).pack(anchor='w',pady=(5,16))
         ttk.Label(f,text='公开测试域名（逗号分隔，不要填写内部或私人域名）').pack(anchor='w')
         self.domains=ttk.Entry(f); self.domains.insert(0,','.join(core.DOMAINS)); self.domains.pack(fill='x')
         opts=ttk.Frame(f); opts.pack(fill='x',pady=10)
@@ -39,7 +39,8 @@ class App:
         ttk.Combobox(perf,textvariable=self.sample,values=('1','2','4'),state='readonly',width=6).grid(row=0,column=3,padx=5)
         tuning_box=ttk.LabelFrame(f,text='自动参数调优实验',padding=8); tuning_box.pack(fill='x',pady=(0,8))
         ttk.Checkbutton(tuning_box,text='下载并发度寻优（三次预探测；锁定条件；序贯配对）',variable=self.tune).pack(anchor='w')
-        ttk.Label(tuning_box,text='固定条件相邻配对；新鲜边界复用；网卡流量差分。仅测当前 HTTPS 路径。').pack(anchor='w')
+        ttk.Label(tuning_box,text='固定条件相邻配对；新鲜边界复用；物理网卡每秒采样。仅测当前 HTTPS 路径。',font=(self.font_family,10)).pack(anchor='w')
+        ttk.Label(tuning_box,text='低负载判定：总收发速率低于 0.5 Mbps，连续 3 个采样区间。共享模式最多等待 8 秒；受控模式最多等待 20 秒。',font=(self.font_family,9)).pack(anchor='w',pady=(3,0))
         ttk.Checkbutton(tuning_box,text='受控实验模式（仅在主动停止其他网络活动时勾选；默认允许正常上网）',variable=self.controlled).pack(anchor='w')
         self.selected={}
         servers=ttk.LabelFrame(f,text='公开 DNS 候选（当前网卡的 IPv4 DNS 自动加入）',padding=8); servers.pack(fill='x',pady=(0,12))
@@ -50,13 +51,35 @@ class App:
         self.go=ttk.Button(actions,text='开始分析与优化推荐',command=self.begin); self.go.pack(side='left')
         self.cancel=ttk.Button(actions,text='取消',state='disabled',command=self.stop.set); self.cancel.pack(side='left',padx=8)
         self.open=ttk.Button(actions,text='打开 HTML 报告',state='disabled',command=self.open_report); self.open.pack(side='left')
-        self.status=tk.StringVar(value='就绪'); ttk.Label(f,textvariable=self.status,wraplength=780).pack(anchor='w',pady=12)
+        self.open_json_button=ttk.Button(actions,text='打开 report.json',state='disabled',command=self.open_json); self.open_json_button.pack(side='left',padx=(8,0))
+        self.open_folder_button=ttk.Button(actions,text='打开报告文件夹',state='disabled',command=self.open_folder); self.open_folder_button.pack(side='left',padx=(8,0))
+        self.status=tk.StringVar(value='就绪'); ttk.Label(f,textvariable=self.status,wraplength=950,font=(self.font_family,10)).pack(anchor='w',pady=14)
         self.table=ttk.Treeview(f,columns=('name','server','success','median','p95','current'),show='headings',height=8)
         for k,t,w in [('name','DNS 服务',140),('server','服务器',115),('success','成功/计划',90),('median','中位 ms',85),('p95','P95 ms',85),('current','当前配置',90)]:
             self.table.heading(k,text=t); self.table.column(k,width=w,anchor='center')
         self.table.pack(fill='both',expand=True)
-        self.logbox=tk.Text(f,height=8,wrap='word',state='disabled'); self.logbox.pack(fill='x',pady=(12,0))
+        self.logbox=tk.Text(f,height=8,wrap='word',state='disabled',font=(self.font_family,10),padx=9,pady=7,spacing1=3,spacing3=3); self.logbox.pack(fill='x',pady=(12,0))
         root.after(100,self.poll); root.protocol('WM_DELETE_WINDOW',self.close)
+    @staticmethod
+    def configure_fonts(root):
+        try:families=set(tkfont.families(root))
+        except tk.TclError:families=set()
+        default_family=tkfont.nametofont('TkDefaultFont',root=root).actual('family')
+        family=next((name for name in ('Microsoft YaHei UI','Microsoft YaHei','Segoe UI') if name in families),default_family)
+        for name,size in (('TkDefaultFont',10),('TkTextFont',10),('TkMenuFont',10),('TkHeadingFont',11)):
+            try:tkfont.nametofont(name,root=root).configure(family=family,size=size)
+            except tk.TclError:pass
+        style=ttk.Style(root)
+        style.configure('.',font=(family,10))
+        style.configure('TLabel',font=(family,10))
+        style.configure('TButton',font=(family,10),padding=(11,7))
+        style.configure('TCheckbutton',font=(family,10))
+        style.configure('TEntry',font=(family,10),padding=5)
+        style.configure('TCombobox',font=(family,10),padding=4)
+        style.configure('TLabelframe.Label',font=(family,10,'bold'))
+        style.configure('Treeview',font=(family,10),rowheight=30)
+        style.configure('Treeview.Heading',font=(family,10,'bold'),padding=(7,8))
+        return family
     def log(self,s):
         self.logbox.config(state='normal'); self.logbox.insert('end',s+'\n'); self.logbox.see('end'); self.logbox.config(state='disabled')
     def begin(self):
@@ -71,7 +94,7 @@ class App:
         servers={ip:label for label,ip in core.PRESETS.items() if self.selected[ip].get()}
         tuning_budget=tuning.maximum_budget_bytes(rounds,tuning.CONCURRENCY_LEVELS)/(1024**2) if tune else 0
         if not messagebox.askyesno('确认测量',f'将查询所选 DNS，测试多个公网目标的连接。HTTPS 下载样本计划上限 {sample*(rounds+2)+0.125 if https else 0} MiB（含预探测和最多两次补测），并发寻优额外正文预算最坏约 {tuning_budget:.1f} MiB（含三次预探测与最多四组追加配对）；另有小请求、协议及错误开销（非硬流量上限）。服务商可能记录请求；不会修改系统设置。继续？'):return
-        self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.report=None
+        self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.open_json_button.config(state='disabled'); self.open_folder_button.config(state='disabled'); self.report=None
         for item in self.table.get_children():self.table.delete(item)
         def task():
             warnings=[]; snap={}; current={}; observer=monitor.Monitor()
@@ -112,15 +135,16 @@ class App:
                     except (core.ProbeError,OSError,ValueError):warnings.append('无法取得并发寻优结束时网络快照。')
                     tuning_result=tuning.apply_environment_gate(tuning_result,observer.evidence('tuning'))
                     tuning_result['monitoring_overhead']=observer.overhead(tuning_result.get('pilots',[])+tuning_result.get('batches',[]))
+                    tuning_result['load_monitor']=observer.load_evidence()
                 observer.close()
                 phases=[observer.evidence('dns'),observer.evidence('performance')]
                 if tune:phases.append(observer.evidence('tuning'))
                 emit('读取 IPv6 绑定及防火墙配置旁证…')
-                env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
+                env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,load_monitor=observer.load_evidence(),ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
                 core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
-                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.5','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
-                directory=Path.home()/'Downloads'/'AdaptiveNetworkOptimizer'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
+                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.6','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                directory=core.new_report_directory()
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
             except Exception as e:self.queue.put(('error',str(e) if isinstance(e,core.ProbeError) else '测量失败：'+type(e).__name__))
@@ -129,6 +153,10 @@ class App:
         threading.Thread(target=task,daemon=True).start()
     def open_report(self):
         if self.report:os.startfile(str(self.report/'report.html'))
+    def open_json(self):
+        if self.report:os.startfile(str(self.report/'report.json'))
+    def open_folder(self):
+        if self.report:os.startfile(str(self.report))
     def poll(self):
         try:
             while True:
@@ -155,7 +183,7 @@ class App:
                     for t in result['tcp']:self.log(f"TCP {t['ip']}：{t['success']}/{t['attempted']}，中位 {t['median_ms']} ms")
                     if result['mtu']:self.log('MTU 估计：'+str(result['mtu']['observed_mtu'])+'；'+result['mtu']['note'])
                     for w in result['warnings']:self.log(w)
-                    self.log('报告：'+str(self.report)); self.open.config(state='normal')
+                    self.log('报告已自动保存到桌面：'+str(self.report/'report.json')); self.open.config(state='normal'); self.open_json_button.config(state='normal'); self.open_folder_button.config(state='normal')
                 elif kind=='done':self.busy=False; self.go.config(state='normal'); self.cancel.config(state='disabled')
         except queue.Empty:pass
         self.root.after(100,self.poll)
