@@ -231,7 +231,7 @@ class TuningTests(unittest.TestCase):
                tuning_telemetry_acceptable=False,telemetry_changes=[dict(field='signal_percent')])
         gated=t.apply_environment_gate(r,e)
         self.assertEqual(gated['selected_concurrency'],2)
-        self.assertEqual(gated['environment_evidence_level'],'VERIFIED_PAIR_SCOPE')
+        self.assertEqual(gated['environment_evidence_level'],'GLOBAL_GUARD_PASSED')
         e['telemetry_changes'].append(dict(field='Status'))
         gated=t.apply_environment_gate(r,e)
         self.assertIsNone(gated['selected_concurrency'])
@@ -270,7 +270,7 @@ class TuningTests(unittest.TestCase):
             self.assertLessEqual(e['finished_elapsed_s'],after['capture_start_s'])
         gated=t.apply_environment_gate(r,observer.evidence('tuning'))
         self.assertEqual(gated['selected_concurrency'],2)
-        self.assertEqual(gated['environment_evidence_level'],'VERIFIED_PAIR_SCOPE')
+        self.assertEqual(gated['environment_evidence_level'],'GLOBAL_GUARD_PASSED')
 
     def test_shared_mode_is_observation_not_formal_recommendation(self):
         r=self.run_fake(candidates=(1,2),observer=FakeObserver(),usage_mode='shared')
@@ -328,6 +328,55 @@ class TuningTests(unittest.TestCase):
         self.assertFalse(t.apply_environment_gate(r,e)['qualified_subset_environment_verified'])
         self.assertFalse(r['comparison_ready'])
         self.assertIsNone(r['selected_concurrency'])
+    def test_local_evidence_survives_another_candidates_failure(self):
+        def mixed(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['concurrency']==4:
+                b.update(status='Failed',actual_bytes=0,aggregate_mbps=None,success=0)
+            return b
+        r=self.run_fake(mixed,candidates=(1,2,4),observer=FakeObserver())
+        gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=True,
+            adapter_state_coverage=True,telemetry_changes=[]))
+        local={x['concurrency']:x for x in gated['candidate_local_evidence']}
+        self.assertTrue(local[2]['local_evidence_certified'])
+        self.assertFalse(local[4]['local_evidence_certified'])
+        self.assertTrue(gated['global_environment_guard_passed'])
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertEqual(gated['qualified_subset_locally_certified'],[2])
+
+    def test_global_configuration_gate_does_not_erase_local_candidate_evidence(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver())
+        gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=False,
+            adapter_state_coverage=True,telemetry_changes=[]))
+        self.assertTrue(gated['candidate_local_evidence'][0]['local_evidence_certified'])
+        self.assertFalse(gated['global_environment_guard_passed'])
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertEqual(gated['candidate_local_evidence'][0]['evidence_state'],'SUPPORTED_GAIN')
+
+    def test_candidate_load_failure_is_not_a_global_load_veto(self):
+        r=self.run_fake(candidates=(1,2,4),observer=FakeObserver())
+        for row in r['summary']:
+            if row['concurrency']==4:
+                row['load_coverage_ok']=False
+                row['load_verified_pairs']=2
+                row['evidence_state']='IRRECOVERABLE_COMPLETION'
+                row['eligible']=False
+        r['comparison_ready']=False
+        r['provisional_concurrency']=2
+        r['qualified_subset_candidates']=[1,2]
+        r['qualified_subset_concurrency']=2
+        r['load_scheduler_enabled']=True
+        r['pilot_load_coverage_ok']=True
+        r['load_window_coverage_ok']=False
+        gated=t.apply_environment_gate(r,dict(complete=True,observed_stable=True,
+            adapter_state_coverage=True,telemetry_changes=[]))
+        local={x['concurrency']:x for x in gated['candidate_local_evidence']}
+        self.assertTrue(gated['pilot_load_environment_guard_passed'])
+        self.assertTrue(gated['global_environment_guard_passed'])
+        self.assertTrue(local[2]['local_evidence_certified'])
+        self.assertFalse(local[4]['local_evidence_certified'])
+        self.assertFalse(gated['recommendation_allowed'])
+
     def test_load_isolation_marks_all_batches_but_does_not_split_pairs(self):
         class Marker(FakeLoadMonitor):
             def __init__(self):super().__init__();self.events=[]
