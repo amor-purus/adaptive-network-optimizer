@@ -403,7 +403,9 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         result['evidence_level']='TENTATIVE'
         result['comparison_ready']=False
         result['decision']='TENTATIVE_ONLY'
-        result['decision_note']='存在暂定方向，但候选或预探测证据不足；不正式推荐。'
+        if result['provisional_concurrency']==1 and 'SUPPORTED_NO_GAIN' not in states:
+            result['provisional_concurrency']=None
+        result['decision_note']='存在初步比较，但候选或预探测证据不足；不正式推荐。'
     result['status']='Blocked' if result['blocked'] else 'Completed' if complete else 'Incomplete'
 
     return result

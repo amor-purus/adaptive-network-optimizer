@@ -111,7 +111,7 @@ class TuningTests(unittest.TestCase):
         def blocked(*a,**kw):return dict(fake_batch(*a,**kw),http_blocked=True)
         r=self.run_fake(blocked);self.assertEqual(r['status'],'Blocked');self.assertEqual(r['batches'],[])
     def test_budget_prevents_partial_pair_start(self):
-        r=self.run_fake(phase_seconds=100);self.assertTrue(r['time_budget_exhausted'])
+        r=self.run_fake(phase_seconds=50);self.assertTrue(r['time_budget_exhausted'])
         self.assertEqual(r['batches'],[]);self.assertFalse(r['comparison_ready'])
     def test_missing_or_unstable_environment(self):
         r=self.run_fake()
@@ -147,8 +147,8 @@ class TuningTests(unittest.TestCase):
                 speed=1.2 if b['round']%2 else 1.0
                 b.update(aggregate_mbps=speed,elapsed_s=b['actual_bytes']*8/1e6/speed)
             return b
-        r=self.run_fake(mixed,candidates=(1,2))
-        self.assertEqual(r['extra_pairs'],3);self.assertEqual(len(r['pairs']),6)
+        r=self.run_fake(mixed,candidates=(1,2),rounds=5)
+        self.assertEqual(r['extra_pairs'],3);self.assertEqual(len(r['pairs']),8)
         self.assertFalse(r['comparison_ready']);self.assertEqual(r['evidence_level'],'TENTATIVE')
         self.assertEqual(r['stop_reason'],'CANDIDATE_PAIR_LIMIT')
     def test_irrecoverable_spread_stops_without_retry(self):
@@ -167,6 +167,32 @@ class TuningTests(unittest.TestCase):
         r=dict(comparison_ready=False,provisional_concurrency=2,evidence_level='TENTATIVE')
         e=dict(complete=True,observed_stable=True,telemetry_complete=True,tuning_telemetry_acceptable=True)
         self.assertIsNone(t.apply_environment_gate(r,e)['selected_concurrency'])
+    def test_pilot_failures_prevent_formal_recommendation(self):
+        calls=[]
+        def partial(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['round']==0:
+                calls.append(1)
+                if len(calls)>1:b.update(status='Failed',actual_bytes=0,aggregate_mbps=None,success=0)
+            return b
+        r=self.run_fake(partial,candidates=(1,2))
+        self.assertEqual(r['formal_plan']['pilot_success_count'],1)
+        self.assertEqual(r['formal_plan']['connect_timeout_seconds'],10)
+        self.assertEqual(r['evidence_level'],'TENTATIVE')
+        self.assertFalse(r['comparison_ready'])
+    def test_global_extra_budget_and_fairness(self):
+        def mixed(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['concurrency']>1:
+                speed=1.2 if b['round']%2 else 1
+                b.update(aggregate_mbps=speed,elapsed_s=b['actual_bytes']*8/1e6/speed)
+            return b
+        r=self.run_fake(mixed,rounds=5)
+        self.assertEqual(r['extra_pairs'],4)
+        self.assertEqual(r['stop_reason'],'EXTRA_PAIR_LIMIT')
+        self.assertEqual([s['attempted_rounds'] for s in r['summary']],[7,6,6])
+        self.assertFalse(r['recommendation_allowed'])
+        self.assertLessEqual(r['reserved_bytes'],r['requested_budget_bytes'])
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
