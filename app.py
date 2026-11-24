@@ -11,11 +11,12 @@ from tkinter import ttk, messagebox
 import uuid
 import core
 import validity
+import performance
 
 class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
-        root.title('自适应网络优化工具 0.1.1'); root.geometry('850x700'); root.minsize(680,580)
+        root.title('自适应网络优化工具 0.2.0'); root.geometry('950x800'); root.minsize(760,660)
         f=ttk.Frame(root,padding=20); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=('Microsoft YaHei UI',20)).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置').pack(anchor='w',pady=(4,14))
@@ -28,6 +29,12 @@ class App:
         ttk.Label(opts,text='MTU IPv4 测试目标').grid(row=0,column=1,sticky='w')
         ttk.Entry(opts,textvariable=self.target,width=20).grid(row=1,column=1,sticky='w')
         ttk.Checkbutton(opts,text='探测 MTU',variable=self.mtu).grid(row=1,column=2,padx=12)
+        self.https=tk.BooleanVar(value=True); self.icmp=tk.BooleanVar(value=True); self.sample=tk.StringVar(value='1')
+        perf=ttk.LabelFrame(f,text='实际网络性能（当前路径）',padding=8); perf.pack(fill='x',pady=(0,8))
+        ttk.Checkbutton(perf,text='HTTPS 延迟与下载测速',variable=self.https).grid(row=0,column=0,sticky='w')
+        ttk.Checkbutton(perf,text='ICMP 多目标测试',variable=self.icmp).grid(row=0,column=1,padx=10,sticky='w')
+        ttk.Label(perf,text='单轮下载 MiB').grid(row=0,column=2,sticky='w')
+        ttk.Combobox(perf,textvariable=self.sample,values=('1','2','4'),state='readonly',width=6).grid(row=0,column=3,padx=5)
         self.selected={}
         servers=ttk.LabelFrame(f,text='公开 DNS 候选（当前网卡的 IPv4 DNS 自动加入）',padding=8); servers.pack(fill='x',pady=(0,12))
         for i,(label,ip) in enumerate(core.PRESETS.items()):
@@ -54,8 +61,9 @@ class App:
             rounds=int(self.rounds.get()); mtu=self.mtu.get(); target=str(ipaddress.IPv4Address(self.target.get())) if mtu else None
             if mtu and not ipaddress.ip_address(target).is_global:raise ValueError('MTU 目标须为公开 IPv4 地址。')
         except (ValueError,UnicodeError) as e:messagebox.showerror('输入错误',str(e));return
+        https=self.https.get(); icmp=self.icmp.get(); sample=int(self.sample.get())
         servers={ip:label for label,ip in core.PRESETS.items() if self.selected[ip].get()}
-        if not messagebox.askyesno('确认测量','将向所选公开 DNS 及当前 DNS 发送上述域名查询，并测试指定公网 IP 的连通性。DNS 服务商可能记录查询。不会修改系统设置。继续？'):return
+        if not messagebox.askyesno('确认测量',f'将查询所选 DNS，测试多个公网目标的连接。HTTPS 下载样本计划 {sample*rounds if https else 0} MiB，另有小请求、协议及错误开销（非硬流量上限）。服务商可能记录请求；不会修改系统设置。继续？'):return
         self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.report=None
         for item in self.table.get_children():self.table.delete(item)
         def task():
@@ -77,14 +85,20 @@ class App:
                 summary,choice,note=core.summarize_dns(rows,servers,domains,rounds,current,gate)
                 warnings.extend(gate['messages'])
                 warnings.append('VPN/代理、DoH、IPv6 DNS、分流及 CDN 可能使真实体验不同；不应仅凭 DNS 延迟变更系统。')
-                emit('测试 IPv4 / IPv6 TCP 443 连接…')
-                tcp=[core.tcp_probe(ip,self.stop) for ip in ('1.1.1.1','2606:4700:4700::1111')]
+                emit('采集实际网络传输性能…')
+                perf=performance.collect(self.stop,emit,rounds,sample,icmp,https)
+                tcp=perf['tcp']
                 mt=None
                 if mtu:
                     try:mt=core.mtu_probe(target,self.stop,emit)
                     except (OSError,subprocess.SubprocessError,core.ProbeError):warnings.append('MTU 探测无法运行；DNS 和 TCP 结果仍保留。')
                 core.check_cancel(self.stop)
-                data={'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.1.1','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                final_snap={}
+                try:final_snap=core.snapshot()
+                except (core.ProbeError,OSError,ValueError):warnings.append('无法取得性能实验后网络快照。')
+                base=performance.baseline(perf,after,final_snap)
+                warnings.extend(perf['warnings'])
+                data={'performance':perf,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.2.0','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=Path.home()/'Downloads'/'AdaptiveNetworkOptimizer'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
@@ -106,6 +120,10 @@ class App:
                     choice=result['recommendation']; msg='推荐 DNS 候选：'+choice['server'] if choice else '无可靠 DNS 推荐'
                     self.status.set(msg); self.log(msg); self.log(result['note'])
                     self.log('实验环境：'+result['validity']['environment']+'；'+result['validity']['scope'])
+                    for h in result['performance']['https_summary']:
+                        self.log(f"HTTPS {h['target']}：{h['success']}/{h['planned']}，TTFB {h['ttfb_median_ms']} ms，有效速度 {h['effective_mbps_median']} Mbps")
+                    for i in result['performance']['icmp']:
+                        self.log(f"ICMP {i['ip']}：无应答 {i['loss_percent']}%，抖动 {i['jitter_ms']} ms")
                     for t in result['tcp']:self.log(f"TCP {t['ip']}：{t['success']}/{t['attempted']}，中位 {t['median_ms']} ms")
                     if result['mtu']:self.log('MTU 估计：'+str(result['mtu']['observed_mtu'])+'；'+result['mtu']['note'])
                     for w in result['warnings']:self.log(w)

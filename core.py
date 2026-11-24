@@ -206,6 +206,11 @@ def save_report(directory,data):
             if rows:
                 w=csv.DictWriter(f,fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
             else: f.write('status\nno_data\n')
+    perf_html=''
+    if 'performance' in data:
+        import performance
+        performance.write_csvs(root,data['performance'])
+        perf_html=performance.report_html(data['performance'],data.get('performance_baseline',{}))
     esc=lambda x:html.escape(str(x)); s=data['dns_summary']; choice=data['recommendation']
     table='<table><tr><th>DNS</th><th>成功/计划</th><th>中位 ms</th><th>P95 ms</th><th>当前配置</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(x)+'</td>' for x in (r['name']+' '+r['server'],f"{r['success']}/{r['planned']}",r['median_ms'],r['p95_ms'],r['current']))+'</tr>' for r in s)+'</table>'
     validity=data.get('validity',{}); gate=validity.get('recommendation_allowed') is True
@@ -214,5 +219,5 @@ def save_report(directory,data):
     valid=[r for r in s if gate and r['eligible']]; top=max((r['median_ms'] for r in valid),default=1) or 1
     bars=''.join('<p>'+esc(r['name'])+' '+esc(r['server'])+' — '+str(r['median_ms'])+' ms</p><div style="height:12px;background:#285eb3;width:%.2f%%"></div>'%(100*r['median_ms']/top) for r in valid)
     details=esc(json.dumps({'tcp':data['tcp'],'mtu':data['mtu'],'warnings':data['warnings'],'validity':data.get('validity',{})},ensure_ascii=False,indent=2))
-    (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font:16px/1.6 system-ui;max-width:1000px;margin:32px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}pre{white-space:pre-wrap}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><h2>实验有效性</h2><p>'+esc(validity.get('environment','environment_unverified'))+'：'+validity_text+'</p><p>下表为原始观测；仅通过有效性检查且完整成功的候选绘图。TCP/MTU 仅代表当前实际路径。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre><p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
+    (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font:16px/1.6 system-ui;max-width:1000px;margin:32px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}pre{white-space:pre-wrap}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><h2>实验有效性</h2><p>'+esc(validity.get('environment','environment_unverified'))+'：'+validity_text+'</p><p>下表为原始观测；仅通过有效性检查且完整成功的候选绘图。TCP/MTU 仅代表当前实际路径。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre>'+perf_html+'<p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
     return root
