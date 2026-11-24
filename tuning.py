@@ -15,6 +15,10 @@ ROUNDS=3
 AGGREGATE_BYTES=512*1024
 MIN_WORKER_BYTES=64*1024
 PILOT_BYTES=128*1024
+PILOT_COUNT=3
+MAX_EXTRA_PAIRS=4
+MAX_EXTRA_PER_CANDIDATE=3
+EXPLORATION_SECONDS=16
 TARGET_SECONDS=8
 MAX_TOTAL_BYTES=512*1024
 MAX_TRANSFER_SECONDS=20
@@ -83,21 +87,21 @@ def run_batch(exe,concurrency,round_number,stop,probe=None,total_bytes=AGGREGATE
             row['worker']=index+1
             row['expected_bytes']=size
             rows[index]=row
-    elapsed=max(clock()-started,0.001)
+    elapsed=clock()-started
     valid=[r for r,size in zip(rows,sizes) if r is not None and _valid(r,size)]
-    complete=len(valid)==concurrency
+    complete=len(valid)==concurrency and math.isfinite(elapsed) and elapsed>0
     actual=sum(max(0,int(r.get('bytes') or 0)) for r in rows if r is not None)
-    speed=round(actual*8/elapsed/1e6,3) if complete else None
+    speed=actual*8/elapsed/1e6 if complete else None
     ttfb=[float(r['ttfb_ms']) for r in valid if isinstance(r.get('ttfb_ms'),(int,float)) and math.isfinite(float(r['ttfb_ms']))]
     categories=sorted({str(r.get('error_category') or r.get('error') or 'INCOMPLETE')
                        for r in rows if r is not None and not _valid(r,r.get('expected_bytes'))})
     blocked=any(r and r.get('http_status') in (403,429) for r in rows)
     return dict(concurrency=concurrency,round=round_number,status='OK' if complete else 'Failed',
-                expected_bytes=total_bytes,actual_bytes=actual,elapsed_s=round(elapsed,4),
+                expected_bytes=total_bytes,actual_bytes=actual,elapsed_s=elapsed,
                 aggregate_mbps=speed,success=len(valid),planned=concurrency,
                 sample_bytes_per_worker=min(sizes),connect_timeout_seconds=connect_timeout,
                 retest=bool(retest),sample_plan=sample_plan or {},
-                ttfb_median_ms=round(statistics.median(ttfb),3) if ttfb else None,
+                ttfb_median_ms=statistics.median(ttfb) if ttfb else None,
                 error_categories=categories,http_blocked=blocked,worker_rows=rows)
 
 
@@ -106,32 +110,50 @@ def _positive(x):
     return isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x) and x>0
 
 
-def calibrate(pilot,candidates,cap):
-    """Use pilot only; freeze workload and timeout before any formal observations."""
-    if not isinstance(cap,int) or not 128*1024<=cap<=MAX_TOTAL_BYTES:
+def raw_speed(batch):
+    elapsed=batch.get('elapsed_s'); actual=batch.get('actual_bytes')
+    return actual*8/elapsed/1e6 if batch.get('status')=='OK' and _positive(elapsed) and _positive(actual) else None
+
+
+def calibrate(pilots,candidates,cap):
+    """Three independent pilots, median calibration and bounded pre-formal exploration."""
+    if not isinstance(cap,int) or not PILOT_BYTES<=cap<=MAX_TOTAL_BYTES:
         raise ValueError('总样本上限须为 128–512 KiB。')
-    speed=pilot.get('aggregate_mbps') if pilot.get('status')=='OK' else None
-    target=int(min(cap,speed*1e6*TARGET_SECONDS/8)) if _positive(speed) else PILOT_BYTES
-    total=max(PILOT_BYTES,2**int(math.log2(max(PILOT_BYTES,target))))
-    total=min(total,cap)
+    speeds=[raw_speed(p) for p in pilots if p.get('actual_bytes')==PILOT_BYTES]
+    speeds=[s for s in speeds if _positive(s)]
+    speed=statistics.median(speeds) if len(speeds)>=2 else None
+    target=int(min(cap,speed*1e6*TARGET_SECONDS/8)) if speed else PILOT_BYTES
+    total=min(cap,max(PILOT_BYTES,2**int(math.log2(max(PILOT_BYTES,target)))))
+    initial_total=total
+    # Only expand before freezing controls. Require a majority of successful pilots,
+    # and the slowest successful pilot to support the larger workload within 16 s.
+    if speed:
+        for c in sorted(candidates):
+            needed=max(PILOT_BYTES,c*MIN_WORKER_BYTES)
+            if needed<=cap and needed*8/(min(speeds)*1e6)<=EXPLORATION_SECONDS:
+                total=max(total,needed)
     timings=[]
-    for w in pilot.get('worker_rows',[]):
-        if w.get('status')!='OK':continue
-        parts=[w.get(k) for k in ('dns_ms','tcp_ms','tls_ms')]
-        if all(isinstance(x,(int,float)) and math.isfinite(x) and x>=0 for x in parts):
-            timings.append(sum(parts))
+    for p in pilots:
+        for w in p.get('worker_rows',[]):
+            if w.get('status')!='OK':continue
+            parts=[w.get(k) for k in ('dns_ms','tcp_ms','tls_ms')]
+            if all(isinstance(x,(int,float)) and math.isfinite(x) and x>=0 for x in parts):
+                timings.append(sum(parts))
     timeout=max(5,min(10,math.ceil(core.percentile(timings,.95)*.002+2))) if timings else 10
+    if len(speeds)<PILOT_COUNT:timeout=10
     active=[c for c in candidates if total>=c*MIN_WORKER_BYTES]
-    return dict(total_bytes=total,connect_timeout_seconds=timeout,max_time_seconds=MAX_TRANSFER_SECONDS,
-                candidates=active,excluded_candidates=[c for c in candidates if c not in active],
-                pilot_speed_mbps=speed,target_seconds=TARGET_SECONDS,
-                mode='pilot_calibrated' if _positive(speed) else 'conservative_fallback',
-                frozen=True)
+    return dict(total_bytes=total,initial_total_bytes=initial_total,connect_timeout_seconds=timeout,
+                max_time_seconds=MAX_TRANSFER_SECONDS,candidates=active,
+                excluded_candidates=[c for c in candidates if c not in active],
+                pilot_speed_mbps=speed,pilot_success_count=len(speeds),pilot_attempt_count=len(pilots),
+                pilot_speeds_mbps=speeds,target_seconds=TARGET_SECONDS,exploration_seconds=EXPLORATION_SECONDS,
+                exploration_expanded=total>initial_total,
+                mode='median_pilot_calibrated' if speed else 'conservative_fallback',frozen=True)
 
 
 def maximum_budget_bytes(rounds=ROUNDS,candidates=CONCURRENCY_LEVELS,total_bytes=MAX_TOTAL_BYTES):
     challengers=sum(c>1 for c in candidates)
-    return PILOT_BYTES+2*(rounds*challengers+int(challengers>0))*total_bytes
+    return PILOT_COUNT*PILOT_BYTES+2*(rounds*challengers+min(MAX_EXTRA_PAIRS,MAX_EXTRA_PER_CANDIDATE*challengers))*total_bytes
 
 
 def _batch_protocol(b):
@@ -155,7 +177,7 @@ def evaluate_pair(baseline,challenger,plan):
             reasons.append('CONTROL_VARIABLE_MISMATCH')
         if (b.get('status')!='OK' or b.get('actual_bytes')!=plan['total_bytes'] or
             b.get('success')!=b.get('concurrency') or b.get('planned')!=b.get('concurrency') or
-            len(b.get('worker_rows',[]))!=b.get('concurrency') or not _positive(b.get('aggregate_mbps'))):
+            len(b.get('worker_rows',[]))!=b.get('concurrency') or not _positive(raw_speed(b))):
             reasons.append('INCOMPLETE_BATCH')
         else:
             sizes=split_sizes(plan['total_bytes'],b['concurrency'])
@@ -166,11 +188,13 @@ def evaluate_pair(baseline,challenger,plan):
     bt,ct=baseline.get('ttfb_median_ms'),challenger.get('ttfb_median_ms')
     if not _positive(bt) or not _positive(ct):reasons.append('TTFB_MISSING')
     reasons=sorted(set(reasons))
+    bs,cs=raw_speed(baseline),raw_speed(challenger)
     return dict(pair_id=baseline.get('pair_id'),concurrency=challenger.get('concurrency'),
                 round=challenger.get('round'),retest=challenger.get('retest',False),
-                valid=not reasons,reasons=reasons,baseline_mbps=baseline.get('aggregate_mbps'),
-                candidate_mbps=challenger.get('aggregate_mbps'),baseline_ttfb_ms=bt,candidate_ttfb_ms=ct,
-                speedup=challenger['aggregate_mbps']/baseline['aggregate_mbps'] if not reasons else None,
+                valid=not reasons,reasons=reasons,baseline_mbps=bs,
+                candidate_mbps=cs,baseline_ttfb_ms=bt,candidate_ttfb_ms=ct,
+                baseline_elapsed_s=baseline.get('elapsed_s'),candidate_elapsed_s=challenger.get('elapsed_s'),
+                speedup=baseline['elapsed_s']/challenger['elapsed_s'] if not reasons else None,
                 latency_ratio=bt/ct if not reasons else None,
                 baseline_success=baseline.get('success',0),baseline_planned=baseline.get('planned',1),
                 candidate_success=challenger.get('success',0),candidate_planned=challenger.get('planned',challenger.get('concurrency',0)),
@@ -213,7 +237,8 @@ def summarize_pairs(pairs,candidates,rounds):
                            paired_baseline_median_mbps=statistics.median(base_rates) if base_rates else None,
                            baseline_variation_ratio=max(base_rates)/min(base_rates) if base_rates else None,
                            paired_median_speedup=ratio,paired_median_speedup_pct=(ratio-1)*100 if ratio else None,
-                           variation_ratio=spread,paired_latency_ratio=latency,material_gain_pairs=votes,
+                           variation_ratio=spread,paired_cv=statistics.pstdev(ratios)/statistics.mean(ratios) if ratios else None,
+                           paired_latency_ratio=latency,material_gain_pairs=votes,
                            ttfb_median_ms=statistics.median([p['candidate_ttfb_ms'] for p in good]) if good else None,
                            composite_score=score if not reasons else None,eligible=not reasons,quality_reasons=reasons))
     return result
@@ -237,6 +262,31 @@ def decide(summary,complete=True,blocked=False):
                 decision_note='从合格配对中选择接近最高相对效用（95%）的最低并发；仅适用于本次固定工作量与当前路径。')
 
 
+def evidence_state(row,rounds):
+    """Descriptive evidence categories, not statistical confidence levels."""
+    n=row['attempted_rounds']; valid=row['paired_rounds']; reasons=row['quality_reasons']
+    remaining=max(0,rounds+MAX_EXTRA_PER_CANDIDATE-n)
+    if 'COMPARABILITY_EVIDENCE_INVALID' in reasons or 'DUPLICATE_PAIR' in reasons:
+        return 'IRRECOVERABLE_COMPARABILITY'
+    # Adding positive observations can never reduce the observed max/min ratio.
+    if row['variation_ratio'] is not None and row['variation_ratio']>2:
+        return 'IRRECOVERABLE_SPREAD'
+    if valid+remaining<rounds or (n+remaining and (valid+remaining)/(n+remaining)<.75):
+        return 'IRRECOVERABLE_COMPLETION'
+    if row['eligible']:
+        if (row['paired_median_speedup']>=1.10 and row['material_gain_pairs']>=math.ceil(2*valid/3)
+            and row['composite_score']>1):
+            return 'SUPPORTED_GAIN'
+        if row['paired_median_speedup']<1.10 and valid-row['material_gain_pairs']>=math.ceil(2*valid/3):
+            return 'SUPPORTED_NO_GAIN'
+    return 'NEEDS_MORE_EVIDENCE' if remaining else 'PAIR_LIMIT_REACHED'
+
+
+def annotate(summary,rounds):
+    for row in summary:row['evidence_state']=evidence_state(row,rounds)
+    return summary
+
+
 def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CONCURRENCY_LEVELS,
         total_bytes=MAX_TOTAL_BYTES,phase_seconds=PHASE_SECONDS,seed=None,clock=time.monotonic):
     candidates=tuple(candidates)
@@ -246,10 +296,11 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     if not isinstance(total_bytes,int) or not PILOT_BYTES<=total_bytes<=MAX_TOTAL_BYTES:raise ValueError('总样本上限无效。')
     core.check_cancel(stop)
     budget=maximum_budget_bytes(rounds,candidates,total_bytes)
-    result=dict(status='Incomplete',parameter='parallel_https_requests',design='adjacent_equal_work_pairs',
+    result=dict(status='Incomplete',parameter='parallel_https_requests',design='sequential_adjacent_equal_work_pairs',
                 requested_candidates=list(candidates),candidates=[],rounds=rounds,requested_budget_bytes=budget,
                 reserved_bytes=0,received_body_bytes=0,time_budget_seconds=phase_seconds,time_budget_exhausted=False,
-                budget_exhausted=False,pilot=None,formal_plan=None,batches=[],pairs=[],summary=[],randomized_order=[],
+                budget_exhausted=False,pilot=None,pilots=[],formal_plan=None,batches=[],pairs=[],summary=[],randomized_order=[],
+                sampling_trace=[],extra_pairs=0,extra_pair_limit=MAX_EXTRA_PAIRS,stop_reason=None,evidence_level='INSUFFICIENT',
                 retest_status='NotNeeded',retest_candidate=None,blocked=False,comparison_ready=False,
                 recommendation_allowed=False,selected_concurrency=None,provisional_concurrency=None,
                 scope='当前 Cloudflare HTTPS 路径与固定工作量，可能经过代理/TUN；非物理带宽或 yt-dlp -N 参数。')
@@ -263,15 +314,19 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         if clock()+seconds>deadline:result['time_budget_exhausted']=True;return False
         if result['reserved_bytes']+size>budget:result['budget_exhausted']=True;return False
         return True
-    if not reserve(PILOT_BYTES,MAX_BATCH_SECONDS):
-        result.update(decision='INCOMPLETE_EXPERIMENT',decision_note='预探测预算不足。');return result
-    emit('并发实验预探测：128 KiB；此样本不进入正式比较。')
-    pilot=run_batch(exe,1,0,stop,probe,PILOT_BYTES,clock,connect_timeout=5)
-    result['pilot']=pilot;result['reserved_bytes']+=PILOT_BYTES
-    result['received_body_bytes']+=pilot['actual_bytes']
-    if pilot['http_blocked']:
-        result.update(status='Blocked',blocked=True,decision='HTTP_BLOCKED',decision_note='预探测收到 HTTP 403/429，停止该实验。');return result
-    plan=calibrate(pilot,candidates,total_bytes);result['formal_plan']=plan
+    for pindex in range(PILOT_COUNT):
+        core.check_cancel(stop)
+        if not reserve(PILOT_BYTES,MAX_BATCH_SECONDS):
+            result.update(stop_reason='PILOT_BUDGET',decision='INCOMPLETE_EXPERIMENT',decision_note='预探测预算不足。');return result
+        emit('独立预探测 %d/%d：128 KiB；不进入正式比较。'%(pindex+1,PILOT_COUNT))
+        pilot=run_batch(exe,1,0,stop,probe,PILOT_BYTES,clock,connect_timeout=5)
+        pilot['pilot_index']=pindex+1
+        result['pilots'].append(pilot)
+        if pindex==0:result['pilot']=pilot
+        result['reserved_bytes']+=PILOT_BYTES;result['received_body_bytes']+=pilot['actual_bytes']
+        if pilot['http_blocked']:
+            result.update(status='Blocked',blocked=True,stop_reason='HTTP_BLOCKED',decision='HTTP_BLOCKED',decision_note='预探测收到 HTTP 403/429，停止该实验。');return result
+    plan=calibrate(result['pilots'],candidates,total_bytes);result['formal_plan']=plan
     result['aggregate_bytes_per_batch']=plan['total_bytes'];result['candidates']=plan['candidates']
     challengers=[c for c in plan['candidates'] if c>1]
     if not challengers:
@@ -305,22 +360,52 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         for c in order:
             if not pair(c,r):complete=False;break
         if not complete:break
-    summary=summarize_pairs(result['pairs'],plan['candidates'],rounds)
-    # One supplementary pair total. Preserve all failures; never replace a bad pair.
+    summary=annotate(summarize_pairs(result['pairs'],plan['candidates'],rounds),rounds)
+    def trace():
+        result['sampling_trace'].append(dict(extra_pairs=result['extra_pairs'],states=[
+            dict(concurrency=s['concurrency'],attempted=s['attempted_rounds'],valid=s['paired_rounds'],
+                 state=s['evidence_state'],reasons=s['quality_reasons']) for s in summary]))
+    trace()
+    # Minimum coverage first. Additional pairs only for unresolved, recoverable candidates.
+    # Fair priority: least sampled first, then lower concurrency; never erase failures.
     if complete and not result['blocked']:
-        doubtful=[s for s in summary if not s['eligible'] and s['paired_rounds']>0 and
-                  'COMPARABILITY_EVIDENCE_INVALID' not in s['quality_reasons']]
-        if doubtful:
-            best=max(doubtful,key=lambda s:(s['paired_rounds'],s['paired_median_speedup'] or 0,-s['concurrency']))
-            c=best['concurrency'];result['retest_candidate']=c
+        while result['extra_pairs']<MAX_EXTRA_PAIRS:
+            pending=[s for s in summary if s['evidence_state']=='NEEDS_MORE_EVIDENCE']
+            if not pending:break
+            chosen=min(pending,key=lambda s:(s['attempted_rounds'],s['concurrency']))
+            c=chosen['concurrency'];r=chosen['attempted_rounds']+1
+            result['retest_candidate']=c
             before=len(result['batches'])
-            done=pair(c,rounds+1,True)
-            result['retest_status']='Completed' if done else 'Skipped_or_incomplete'
-            if not done and len(result['batches'])!=before:complete=False
-            summary=summarize_pairs(result['pairs'],plan['candidates'],rounds)
+            done=pair(c,r,True)
+            if not done:
+                result['retest_status']='Skipped_or_incomplete'
+                if len(result['batches'])!=before:complete=False
+                break
+            result['extra_pairs']+=1;result['retest_status']='Completed'
+            summary=annotate(summarize_pairs(result['pairs'],plan['candidates'],rounds),rounds)
+            trace()
     result['summary']=summary
+    states=[s['evidence_state'] for s in summary]
+    resolved=bool(states) and all(s in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN') for s in states)
+    if result['blocked']:reason='HTTP_BLOCKED'
+    elif result['time_budget_exhausted']:reason='TIME_BUDGET'
+    elif result['budget_exhausted']:reason='BYTE_BUDGET'
+    elif not complete:reason='INCOMPLETE_FORMAL_COVERAGE'
+    elif resolved:reason='EVIDENCE_SUFFICIENT'
+    elif result['extra_pairs']>=MAX_EXTRA_PAIRS:reason='EXTRA_PAIR_LIMIT'
+    elif 'PAIR_LIMIT_REACHED' in states:reason='CANDIDATE_PAIR_LIMIT'
+    else:reason='NO_RECOVERABLE_CANDIDATE'
+    result['stop_reason']=reason
     result.update(decide(summary,complete,result['blocked']))
+    if result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2:
+        result['evidence_level']='SUPPORTED_WITHIN_TESTED_SCOPE'
+    elif result['comparison_ready']:
+        result['evidence_level']='TENTATIVE'
+        result['comparison_ready']=False
+        result['decision']='TENTATIVE_ONLY'
+        result['decision_note']='存在暂定方向，但候选或预探测证据不足；不正式推荐。'
     result['status']='Blocked' if result['blocked'] else 'Completed' if complete else 'Incomplete'
+
     return result
 
 
@@ -333,6 +418,7 @@ def apply_environment_gate(result,evidence):
     result['recommendation_allowed']=bool(stable and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
     result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
     if not stable:
+        result['evidence_level']='INSUFFICIENT'
         result['measurement_comparison_ready']=bool(result.get('comparison_ready'))
         result['comparison_ready']=False
         if result.get('decision') not in ('HTTP_BLOCKED','CURL_UNAVAILABLE','INCOMPLETE_EXPERIMENT'):
@@ -348,16 +434,18 @@ def write_csvs(root,result):
             w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
             for r in rows:w.writerow({k:r.get(k) for k in fields})
     batches=result.get('batches',[])
+    write('tuning_pilots.csv',result.get('pilots',[]),['pilot_index','status','expected_bytes','actual_bytes','elapsed_s','aggregate_mbps','error_categories'])
+    write('tuning_sampling_trace.csv',[dict(extra_pairs=x['extra_pairs'],**s) for x in result.get('sampling_trace',[]) for s in x['states']],['extra_pairs','concurrency','attempted','valid','state','reasons'])
     write('tuning_batches.csv',batches,['pair_id','baseline_for','sequence','concurrency','round','retest','status','expected_bytes','actual_bytes','elapsed_s','aggregate_mbps','success','planned','ttfb_median_ms','connect_timeout_seconds','max_time_seconds','error_categories'])
     workers=[dict(w,pair_id=b.get('pair_id'),concurrency=b['concurrency'],round=b['round']) for b in batches for w in b.get('worker_rows',[])]
     write('tuning_workers.csv',workers,['pair_id','concurrency','round','worker','status','expected_bytes','bytes','effective_mbps','ttfb_ms','total_ms','http_status','http_version','error_category','failure_phase'])
-    write('tuning_pairs.csv',result.get('pairs',[]),['pair_id','concurrency','round','retest','baseline_first','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio','baseline_success','baseline_planned','candidate_success','candidate_planned','http_version'])
-    write('tuning_summary.csv',result.get('summary',[]),['concurrency','planned_rounds','attempted_rounds','successful_rounds','pair_completion_rate','success_rate','paired_baseline_median_mbps','median_mbps','baseline_variation_ratio','paired_median_speedup_pct','variation_ratio','paired_latency_ratio','material_gain_pairs','composite_score','eligible','quality_reasons'])
+    write('tuning_pairs.csv',result.get('pairs',[]),['pair_id','concurrency','round','retest','baseline_first','valid','reasons','baseline_mbps','candidate_mbps','baseline_elapsed_s','candidate_elapsed_s','speedup','latency_ratio','baseline_success','baseline_planned','candidate_success','candidate_planned','http_version'])
+    write('tuning_summary.csv',result.get('summary',[]),['concurrency','planned_rounds','attempted_rounds','successful_rounds','pair_completion_rate','success_rate','paired_baseline_median_mbps','median_mbps','baseline_variation_ratio','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','quality_reasons','evidence_state'])
 
 
 def report_html(result):
     esc=lambda x:html.escape(str(x if x is not None else '—'))
-    labels={'concurrency':'并发数','paired_rounds':'有效配对数','pair_completion_rate':'配对完成率','paired_baseline_median_mbps':'配对基线中位 Mbps','median_mbps':'候选中位 Mbps','paired_median_speedup_pct':'配对中位提升 %','variation_ratio':'配对比值波动倍数','composite_score':'相对效用','eligible':'合格','quality_reasons':'质量原因','pair_id':'配对编号','baseline_first':'基线先测','valid':'有效','reasons':'原因','baseline_mbps':'基线 Mbps','candidate_mbps':'候选 Mbps','speedup':'速度比','latency_ratio':'基线/候选 TTFB 比'}
+    labels={'concurrency':'并发数','paired_rounds':'有效配对数','pair_completion_rate':'配对完成率','paired_baseline_median_mbps':'配对基线中位 Mbps','median_mbps':'候选中位 Mbps','paired_median_speedup_pct':'配对中位提升 %','variation_ratio':'配对比值波动倍数','composite_score':'相对效用','eligible':'合格','quality_reasons':'质量原因','evidence_state':'证据状态','pair_id':'配对编号','baseline_first':'基线先测','valid':'有效','reasons':'原因','baseline_mbps':'基线 Mbps','candidate_mbps':'候选 Mbps','speedup':'速度比','latency_ratio':'基线/候选 TTFB 比'}
     def table(rows,fields):
         return '<table><tr>'+''.join('<th>'+esc(labels.get(k,k))+'</th>' for k in fields)+'</tr>'+''.join('<tr>'+''.join('<td>'+esc(r.get(k))+'</td>' for k in fields)+'</tr>' for r in rows)+'</table>'
-    return '<h2>等工作量相邻配对寻优</h2><p>建议并发：'+esc(result.get('selected_concurrency'))+'；'+esc(result.get('decision_note'))+'</p><p>预探测独立，正式条件锁定：'+esc(result.get('formal_plan'))+'；正文计划上限 '+esc(result.get('requested_budget_bytes'))+' 字节；实际预留 '+esc(result.get('reserved_bytes'))+'；接收 '+esc(result.get('received_body_bytes'))+'。</p><p>效用基线为 1：配对速度比^0.65 × 完成可靠性^0.25 × 延迟惩罚^0.10。未通过质量门槛不评分。无线速率上升仅为旁证，不证明负载因果。结果仅适用于当前路径及工作量。</p>'+table(result.get('summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_baseline_median_mbps','median_mbps','paired_median_speedup_pct','variation_ratio','composite_score','eligible','quality_reasons'])+'<h3>原始配对</h3>'+table(result.get('pairs',[]),['pair_id','baseline_first','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio'])
+    return '<h2>序贯等工作量相邻配对寻优</h2><p>证据等级：'+esc(result.get('evidence_level'))+'；停止原因：'+esc(result.get('stop_reason'))+'；额外配对数：'+esc(result.get('extra_pairs'))+'。证据等级是工程规则，不是统计置信概率。</p><p>建议并发：'+esc(result.get('selected_concurrency'))+'；'+esc(result.get('decision_note'))+'</p><p>预探测独立，正式条件锁定：'+esc(result.get('formal_plan'))+'；正文计划上限 '+esc(result.get('requested_budget_bytes'))+' 字节；实际预留 '+esc(result.get('reserved_bytes'))+'；接收 '+esc(result.get('received_body_bytes'))+'。</p><p>效用基线为 1：配对速度比^0.65 × 完成可靠性^0.25 × 延迟惩罚^0.10。未通过质量门槛不评分。无线速率上升仅为旁证，不证明负载因果。结果仅适用于当前路径及工作量。</p>'+table(result.get('summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_baseline_median_mbps','median_mbps','paired_median_speedup_pct','variation_ratio','composite_score','eligible','quality_reasons','evidence_state'])+'<h3>原始配对</h3>'+table(result.get('pairs',[]),['pair_id','baseline_first','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio'])
