@@ -12,6 +12,7 @@ import threading
 import time
 import core
 import validity
+import traffic
 
 INTERVAL=45
 MAX_PERIODIC=120
@@ -89,7 +90,7 @@ class Monitor:
     """One periodic reader, serialized with checkpoints; no overlapping snapshot reads."""
     def __init__(self,interval=INTERVAL,limit=MAX_PERIODIC,reader=core.snapshot,wlan=wlan_snapshot):
         self.interval=interval;self.limit=limit;self.reader=reader;self.wlan=wlan
-        self.lock=threading.Lock();self.stop=threading.Event();self.records=[];self.phase='dns';self.periodic=0;self.t0=time.monotonic();self.thread=None
+        self.lock=threading.Lock();self.stop=threading.Event();self.records=[];self.boundary_reuses=[];self.boundary_waits=[];self.phase='dns';self.periodic=0;self.t0=time.monotonic();self.thread=None
     def _capture(self,label):
         t=time.monotonic(); stamp=datetime.datetime.now().astimezone().isoformat()
         try:s=self.reader();s=s if isinstance(s,dict) else {}
@@ -105,10 +106,42 @@ class Monitor:
             if next_phase:self.phase=next_phase
             return s
     def mark(self,label):
-        """Return an immutable timeline index for a synchronous observation boundary."""
+        """Reuse only the immediately previous fresh full endpoint."""
+        requested=time.monotonic()
         with self.lock:
+            now=time.monotonic()-self.t0
+            last=self.records[-1] if self.records else None
+            if (label.startswith('pair_') and label.endswith('_begin') and last and
+                last['phase']=='tuning' and (last['label'].endswith('_end') or last['label']=='periodic') and
+                0<=now-last['capture_end_s']<=1 and complete(last['snapshot']) and telemetry_available(last)):
+                index=len(self.records)-1
+                self.boundary_reuses.append(dict(label=label,index=index,age_seconds=now-last['capture_end_s']))
+                return index
             self._capture(label)
+            self.boundary_waits.append(time.monotonic()-requested)
             return len(self.records)-1
+
+    def boundary_reserve(self):
+        with self.lock:
+            durations=[r['capture_end_s']-r['capture_start_s'] for r in self.records[-10:]]+self.boundary_waits[-10:]
+        return min(52,max(10,math.ceil(2*max(durations)+2))) if durations else 52
+
+    def traffic_sample(self):
+        with self.lock:
+            last=self.records[-1] if self.records else {}
+            indices=[a['ifIndex'] for a in last.get('snapshot',{}).get('adapters',[]) if a.get('Status')=='Up' and isinstance(a.get('ifIndex'),int)]
+        return traffic.sample(indices)
+
+    def overhead(self,batches):
+        with self.lock:
+            records=[r for r in self.records if r['phase']=='tuning'];reuses=list(self.boundary_reuses);waits=list(self.boundary_waits)
+        intervals=[(b['started_elapsed_s'],b['finished_elapsed_s']) for b in batches if 'started_elapsed_s' in b and 'finished_elapsed_s' in b]
+        total=sum(r['capture_end_s']-r['capture_start_s'] for r in records)
+        overlap=sum(max(0,min(r['capture_end_s'],b)-max(r['capture_start_s'],a)) for r in records for a,b in intervals)
+        return dict(full_snapshots=len(records),reused_boundaries=len(reuses),reuse_events=reuses,full_capture_seconds=total,
+                    overlap_with_batch_seconds=overlap,nonoverlapping_capture_seconds=max(0,total-overlap),boundary_call_seconds=sum(waits),
+                    native_counter_capture_seconds=sum(b.get('traffic',{}).get('capture_seconds',0) for b in batches),
+                    scope='按时间区间核算采集开销，不推断监测造成的速度变化。')
 
     def window(self,begin,end,started,finished):
         with self.lock:
@@ -177,6 +210,20 @@ def _rate_value(value,field):
         return None
 
 
+def rate_boundary(before,after,field,identity):
+    nominal=abs(after-before)/max(before,after)
+    wlan=bool(identity and re.search(r'wlan|wi-?fi|wireless',str(identity[-1]),re.I))
+    quantum=100000
+    if wlan and all(abs(v/quantum-round(v/quantum))<1e-7 for v in (before,after)):
+        hi=max(before,after)-quantum/2;lo=min(before,after)+quantum/2
+        lower=max(0,1-lo/hi) if hi>0 else nominal
+        upper=1-(min(before,after)-quantum/2)/(max(before,after)+quantum/2)
+        if lower<=.25<upper:
+            return dict(severity='boundary_uncertain',reason='RATE_BOUNDARY_WITHIN_RESOLUTION',relative_change=nominal,
+                        relative_change_lower=lower,relative_change_upper=upper)
+    return dict(severity='tolerated' if nominal<=.25 else 'significant',
+                reason='WITHIN_LINK_RATE_TOLERANCE' if nominal<=.25 else 'LINK_RATE_CHANGE_EXCEEDS_25_PERCENT',relative_change=nominal)
+
 def classify_telemetry_change(change):
     """Treat small radio/link-rate movement as noise; adapter state changes remain hard failures."""
     field=change.get('field')
@@ -195,10 +242,7 @@ def classify_telemetry_change(change):
         after=_rate_value(change.get('after'),field)
         if before is None or after is None or before<=0 or after<=0:
             return dict(severity='significant',reason='LINK_RATE_TELEMETRY_INCOMPLETE')
-        delta=abs(after-before)/max(abs(before),abs(after))
-        if delta<=.25:
-            return dict(severity='tolerated',reason='WITHIN_LINK_RATE_TOLERANCE',relative_change=round(delta,4))
-        return dict(severity='significant',reason='LINK_RATE_CHANGE_EXCEEDS_25_PERCENT',relative_change=round(delta,4))
+        return rate_boundary(before,after,field,change.get('identity'))
     return dict(severity='significant',reason='UNCLASSIFIED_TELEMETRY_CHANGE')
 
 
@@ -247,13 +291,14 @@ def tuning_radio_assessment(records,classified):
             for value in values:
                 peak=max(peak,value)
                 if value<peak*.75:
-                    cumulative_drops.append(dict(adapter=name,field=field,peak_mbps=peak,observed_mbps=value,classification='CUMULATIVE_RATE_DROP'));break
+                    boundary=rate_boundary(peak*1e6,value*1e6,field,[name])
+                    cumulative_drops.append(dict(adapter=name,field=field,peak_mbps=peak,observed_mbps=value,classification='CUMULATIVE_RATE_DROP_BOUNDARY_UNCERTAIN' if boundary['severity']=='boundary_uncertain' else 'CUMULATIVE_RATE_DROP',**boundary));break
     for c in classified:
         field=c['field']; name=c['identity'][-1] if c.get('identity') else None
-        if c.get('severity')!='significant':continue
+        if c.get('severity') not in ('significant','boundary_uncertain'):continue
         if name in active_names and field in ('LinkSpeed','ReceiveLinkSpeed','TransmitLinkSpeed','rx_mbps','tx_mbps'):
             x=_rate_value(c.get('before'),field);y=_rate_value(c.get('after'),field)
-            if complete and signal_stable and x is not None and y is not None and math.isfinite(x) and math.isfinite(y) and 0<x<y:
+            if c.get('severity')=='significant' and complete and signal_stable and x is not None and y is not None and math.isfinite(x) and math.isfinite(y) and 0<x<y:
                 # Group identical numeric transitions on the same adapter and observation interval.
                 # Keep all original fields, including direction, for audit.
                 k=(name,c.get('from_elapsed_s'),c.get('to_elapsed_s'),round(x/1e5),round(y/1e5))
@@ -371,7 +416,7 @@ def write_csvs(root,env):
     fields=['phase','section','identity','field','before','after','kind','actor','from_elapsed_s','to_elapsed_s','observed_at','before_present','after_present']
     write('environment_changes.csv',changes,fields)
     telemetry=[dict(c,phase=p['phase']) for p in env['phases'] for c in p.get('telemetry_changes',[])]
-    write('network_telemetry_changes.csv',telemetry,['phase','section','identity','field','before','after','severity','reason','delta','relative_change','from_elapsed_s','to_elapsed_s','observed_at'])
+    write('network_telemetry_changes.csv',telemetry,['phase','section','identity','field','before','after','severity','reason','delta','relative_change','relative_change_lower','relative_change_upper','from_elapsed_s','to_elapsed_s','observed_at'])
     rows=[]
     for r in env['timeline']:
         for a in r['snapshot'].get('adapters',[]):
