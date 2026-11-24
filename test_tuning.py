@@ -275,6 +275,15 @@ class TuningTests(unittest.TestCase):
         self.assertFalse(gated['recommendation_allowed'])
         self.assertEqual(gated['evidence_level'],'TENTATIVE')
 
+    def test_native_state_change_blocks_even_if_full_snapshots_stable(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver())
+        r['batches'][0]['traffic']=dict(status='Unavailable',interfaces=[dict(index=16,reason='INTERFACE_STATE_CHANGED')])
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        gated=t.apply_environment_gate(r,e)
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertFalse(gated['global_environment_guard_passed'])
+        self.assertEqual(len(gated['native_state_changes']),1)
+
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:

@@ -1,5 +1,6 @@
 import ctypes
 import unittest
+import os
 import traffic as t
 def sample(rx=100,tx=50,when=0,**kw):
     r=dict(index=16,luid=7,type=71,hardware=True,oper=1,media_state=1,rx=rx,tx=tx);r.update(kw)
@@ -23,5 +24,11 @@ class TrafficTests(unittest.TestCase):
         b['interfaces'].append(dict(b['interfaces'][0],index=43,hardware=False))
         d=t.delta(a,b,100);self.assertEqual(len(d['interfaces']),2);self.assertNotIn('rx_bytes',d)
     def test_native_call(self):
-        self.assertIn(t.sample([1])['status'],('Measured','Partial','Unavailable'))
+        r=t.sample([1]);self.assertIn(r['status'],('Measured','Partial','Unavailable'))
+        if os.name=='nt':
+            # The Windows loopback interface is normally index 1; verify actual ABI/API, not just fallback.
+            self.assertEqual(r['status'],'Measured',r)
+            self.assertEqual(r['interfaces'][0]['index'],1)
+            self.assertGreater(r['interfaces'][0]['luid'],0)
+            self.assertEqual(r['interfaces'][0]['type'],24)
 if __name__=='__main__':unittest.main()

@@ -479,7 +479,9 @@ def apply_environment_gate(result,evidence):
     # Global configuration and adapter state are still hard constraints. Radio tolerances
     # are evaluated inside each pair, not against an unrelated pilot or between-pair sample.
     global_state_changes=[c for c in evidence.get('telemetry_changes',[]) if c.get('field') in ('Status','MediaConnectionState')]
-    global_ok=bool(evidence.get('complete') and evidence.get('observed_stable') and evidence.get('adapter_state_coverage') and not global_state_changes)
+    native_changes=[dict(pair_id=b.get('pair_id'),pilot_index=b.get('pilot_index'),index=r.get('index'),reason=r.get('reason')) for b in result.get('pilots',[])+result.get('batches',[]) for r in b.get('traffic',{}).get('interfaces',[]) if r.get('reason') in ('INTERFACE_IDENTITY_CHANGED','INTERFACE_STATE_CHANGED')]
+    result['native_state_changes']=native_changes
+    global_ok=bool(evidence.get('complete') and evidence.get('observed_stable') and evidence.get('adapter_state_coverage') and not global_state_changes and not native_changes)
     stable=bool(global_ok and result.get('pair_environment_coverage_ok'))
     result['global_environment_guard_passed']=global_ok
     result['environment_stable']=stable
@@ -488,6 +490,7 @@ def apply_environment_gate(result,evidence):
     result['combined_comparison_ready_before_global_gate']=bool(result.get('comparison_ready'))
     result['recommendation_allowed']=bool(stable and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
     result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
+    result['traffic_coverage']=dict(batches=len(result.get('pilots',[]))+len(result.get('batches',[])),measured=sum(b.get('traffic',{}).get('status')=='Measured' for b in result.get('pilots',[])+result.get('batches',[])))
     result['shared_load_observation_concurrency']=None
     if result.get('usage_mode')=='shared' and result['recommendation_allowed']:
         result['shared_load_observation_concurrency']=result['selected_concurrency']
