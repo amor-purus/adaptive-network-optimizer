@@ -156,7 +156,7 @@ def _rate_value(value,field):
             number=float(value)
             return number if number>=0 else None
         text=str(value).strip().lower().replace(',','')
-        match=re.fullmatch(r'(\\d+(?:\\.\\d+)?)\\s*(bps|kbps|mbps|gbps)',text)
+        match=re.fullmatch(r'(\d+(?:\.\d+)?)\s*(bps|kbps|mbps|gbps)',text)
         if not match:return None
         factor={'bps':1,'kbps':1_000,'mbps':1_000_000,'gbps':1_000_000_000}[match.group(2)]
         return float(match.group(1))*factor

@@ -62,7 +62,7 @@ class TuningTests(unittest.TestCase):
         d=t.decide(t.summarize_batches(batches,(1,2,4,8),3),(1,2,4,8),True,False)
         self.assertTrue(d['comparison_ready'])
         self.assertEqual(d['selected_concurrency'],4)
-        self.assertEqual(d['decision'],'LOWEST_CONCURRENCY_NEAR_BEST')
+        self.assertEqual(d['decision'],'LOWEST_CONCURRENCY_NEAR_BEST_COMPOSITE_SCORE')
 
     def test_no_material_gain_keeps_one(self):
         batches=[]
