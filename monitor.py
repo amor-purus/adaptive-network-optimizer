@@ -151,9 +151,11 @@ class Monitor:
         intervals=[(b['started_elapsed_s'],b['finished_elapsed_s']) for b in batches if 'started_elapsed_s' in b and 'finished_elapsed_s' in b]
         total=sum(r['capture_end_s']-r['capture_start_s'] for r in records)
         overlap=sum(max(0,min(r['capture_end_s'],b)-max(r['capture_start_s'],a)) for r in records for a,b in intervals)
+        load=self.load_evidence()
         return dict(full_snapshots=len(records),reused_boundaries=len(reuses),reuse_events=reuses,full_capture_seconds=total,
                     overlap_with_batch_seconds=overlap,nonoverlapping_capture_seconds=max(0,total-overlap),boundary_call_seconds=sum(waits),
                     native_counter_capture_seconds=sum(b.get('traffic',{}).get('capture_seconds',0) for b in batches),
+                    load_sample_count=load.get('sample_count',0),load_sample_capture_seconds=load.get('total_capture_seconds',0),
                     scope='按时间区间核算采集开销，不推断监测造成的速度变化。')
 
     def window(self,begin,end,started,finished):

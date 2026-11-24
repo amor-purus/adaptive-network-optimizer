@@ -154,6 +154,24 @@ class MonitorTests(unittest.TestCase):
         self.assertGreaterEqual(o.boundary_reserve(),10)
         o.records[0]['capture_end_s']-=2
         self.assertNotEqual(o.mark('pair_C2-R2_begin'),first)
+    def test_load_counter_reads_do_not_wait_for_full_snapshot_lock(self):
+        import threading
+        from unittest.mock import patch
+        snap=copy.deepcopy(BASE);snap.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',MediaConnectionState=1)])
+        observer=m.Monitor(reader=lambda:snap,wlan=lambda:dict(status='Measured',interfaces=[]))
+        observer.checkpoint('start')
+        sample=dict(status='Measured',started=1.0,finished=1.001,interfaces=[])
+        result=[]
+        with patch('monitor.traffic.sample',return_value=sample) as native:
+            observer.lock.acquire()
+            try:
+                worker=threading.Thread(target=lambda:result.append(observer.load_sample()))
+                worker.start();worker.join(.5)
+                self.assertFalse(worker.is_alive(),'native counter read waited on full snapshot lock')
+            finally:observer.lock.release()
+            native.assert_called_once_with([16])
+        self.assertEqual(result,[sample])
+
     def test_exports(self):
         env=dict(timeline=[rec('start',BASE,0)],phases=[],ipv6_diagnosis={'note':'<script>'})
         with tempfile.TemporaryDirectory() as d:

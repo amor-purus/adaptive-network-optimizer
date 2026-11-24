@@ -137,6 +137,7 @@ class App:
                     tuning_result['monitoring_overhead']=observer.overhead(tuning_result.get('pilots',[])+tuning_result.get('batches',[]))
                     tuning_result['load_monitor']=observer.load_evidence()
                 observer.close()
+                if tune:tuning_result['load_monitor']=observer.load_evidence()
                 phases=[observer.evidence('dns'),observer.evidence('performance')]
                 if tune:phases.append(observer.evidence('tuning'))
                 emit('读取 IPv6 绑定及防火墙配置旁证…')

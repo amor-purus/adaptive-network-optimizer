@@ -41,7 +41,7 @@ class LoadSampler:
                 previous=self._previous;previous_finished=self._previous_finished
                 if previous is not None and set(previous)==set(physical):
                     elapsed=finished-previous_finished
-                    if 0.5<=elapsed<=max(2.5,self.interval*2.5):
+                    if max(0.005,self.interval*0.5)<=elapsed<=max(2.5,self.interval*2.5):
                         rx_total=tx_total=0;rows=[];valid=True
                         for key in sorted(physical):
                             old_rx,old_tx=previous[key];new_rx,new_tx=physical[key]
