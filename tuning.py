@@ -10,6 +10,7 @@ import secrets
 import statistics
 import time
 import uuid
+from progress import batch_detail, metric
 import core
 import performance
 
@@ -412,6 +413,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         return True
     def wait_load(stage,timeout):
         if not result['load_scheduler_enabled']:return dict(stage=stage,status='NOT_ENABLED',waited_seconds=0,action='PROCEED_TEST_HARNESS')
+        emit(f'正在等待低负载窗口：{stage}；本次等待上限 {timeout:.1f} 秒，需连续 3 个新采样区间。')
         if load_monitor is None:entry=dict(status='LOAD_MONITOR_UNAVAILABLE',waited_seconds=0)
         else:
             try:entry=load_monitor.wait_for_idle(stop,timeout)
@@ -420,6 +422,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         entry=dict(entry,stage=stage,timeout_seconds=timeout)
         entry['action']='PROCEED_IDLE' if entry.get('status')=='IDLE_WINDOW' else 'PROCEED_SHARED_OBSERVATION' if usage_mode=='shared' else 'SKIP'
         result['load_schedule'].append(entry)
+        emit(f'负载窗口 {stage}：{entry.get("status")}；等待 {metric(entry.get("waited_seconds"), " 秒")}；动作 {entry["action"]}。')
         return entry
     def schedule_pilot(index):
         if not result['load_scheduler_enabled']:return wait_load('pilot_%d'%(index+1),0),True
@@ -466,6 +469,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             result.update(stop_reason='PILOT_BUDGET',decision='INCOMPLETE_EXPERIMENT',decision_note='预探测预算不足。');return result
         emit('独立预探测 %d/%d：128 KiB；不进入正式比较。'%(pindex+1,PILOT_COUNT))
         pilot=measure(1,0,PILOT_BYTES,5)
+        emit(f'预探测 {pindex+1}/{PILOT_COUNT} 结束：'+batch_detail(pilot))
         pilot['pilot_index']=pindex+1
         pilot['load_window']=load_window
         pilot['load_window_verified']=(not result['load_scheduler_enabled']) or (load_window.get('status')=='IDLE_WINDOW' and (pilot.get('pre_batch_load_state') is None or pilot['pre_batch_load_state'].get('idle') is True))
@@ -482,6 +486,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     if not challengers:
         result.update(decision='NO_COMPARABLE_CANDIDATE',decision_note='样本预算不足以比较候选。');return result
     emit('正式实验锁定：%d KiB/批，连接超时 %d 秒，候选 %s'%(plan['total_bytes']//1024,plan['connect_timeout_seconds'],plan['candidates']))
+    emit(f'校准完成：预探测中位 {metric(plan.get("pilot_speed_mbps"), " Mbps",3)}；候选 {plan["candidates"]}；排除 {plan["excluded_candidates"]}。')
     initial_order={c:bool(rng.randrange(2)) for c in challengers}
     def pair(c,r,retest=False):
         core.check_cancel(stop)
@@ -494,6 +499,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         order=[1,c] if first else [c,1]
         result['randomized_order'].append(dict(pair_id=ident,order=order))
         measured={}
+        emit(f'准备配对 {ident}：第 {r} 轮，{c} 路对比 1 路；顺序 {order}；每批 {size//1024} KiB。')
         begin,load_window=schedule_pair_boundary(ident,reserve_seconds)
         if begin is None and result['load_scheduler_enabled']:
             result['load_window_unavailable']=True
@@ -503,13 +509,15 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         for n in order:
             core.check_cancel(stop)
             if not reserve(size,MAX_BATCH_SECONDS+boundary_cost()):return False
-            emit(('配对补测' if retest else '相邻配对')+' %s：%d 路'%(ident,n))
+            emit(f'正在{"补测" if retest else "测量"} {ident}：第 {order.index(n)+1}/2 批，{n} 路并发，{"基线" if n==1 else "候选"}；{size//1024} KiB。')
             b=measure(n,r,size,plan['connect_timeout_seconds'],retest)
+            emit(f'{ident} {n} 路批次结束：'+batch_detail(b))
             b.update(pair_id=ident,baseline_for=c,sequence=len(result['batches'])+1,max_time_seconds=plan['max_time_seconds'])
             result['batches'].append(b);measured[n]=b
             result['reserved_bytes']+=size;result['received_body_bytes']+=b['actual_bytes']
             if b['http_blocked']:
                 result['blocked']=True;return False
+        emit(f'正在核验 {ident}：环境快照、负载窗口、协议与等工作量。')
         end=mark('pair_'+ident+'_end')
         p=evaluate_pair(measured[1],measured[c],plan)
         evidence=window(begin,end,measured[order[0]]['started_elapsed_s'],measured[order[-1]]['finished_elapsed_s'])
@@ -528,6 +536,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             p['valid']=False
             p['reasons']=sorted(set(p['reasons']+['PAIR_ENVIRONMENT_NOT_VERIFIED']))
         result['pairs'].append(p)
+        emit(f'{ident} 配对：'+('有效' if p['valid'] else '无效，'+('、'.join(p['reasons']) or '原因未提供'))+'；速度比 '+metric(p.get('speedup'),' 倍',3)+'。')
         return True
     complete=True
     eliminated=set()
@@ -538,6 +547,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             row=summarize_pairs(result['pairs'],[1,c],rounds)[0]
             state=evidence_state(row,rounds)
             if state in ('IRRECOVERABLE_SPREAD','IRRECOVERABLE_COMPARABILITY'):
+                emit(f'{c} 路停止后续正式配对：{state}；保留已采集的全部证据。')
                 eliminated.add(c)
                 result['eliminated_candidates'].append(dict(concurrency=c,after_round=r,reason=state,
                     skipped_formal_pairs=rounds-r,variation_ratio=row['variation_ratio']))
@@ -557,6 +567,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             if not pending:break
             chosen=min(pending,key=lambda s:(s['attempted_rounds'],s['concurrency']))
             c=chosen['concurrency'];r=chosen['attempted_rounds']+1
+            emit(f'证据不足：安排 {c} 路第 {r} 轮补测；追加配对 {result["extra_pairs"]+1}/{MAX_EXTRA_PAIRS}。')
             result['retest_candidate']=c
             before=len(result['batches'])
             done=pair(c,r,True)
@@ -594,6 +605,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     elif 'PAIR_LIMIT_REACHED' in states:reason='CANDIDATE_PAIR_LIMIT'
     else:reason='NO_RECOVERABLE_CANDIDATE'
     result['stop_reason']=reason
+    emit(f'并发配对结束：{reason}；尝试 {len(result["pairs"])} 组；有效 {sum(bool(p["valid"]) for p in result["pairs"])} 组。')
     qualified=[s for s in summary if s['evidence_state'] in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN')]
     result['qualified_subset_candidates']=[1]+[s['concurrency'] for s in qualified] if qualified else []
     if qualified and complete and not result['blocked']:
@@ -782,7 +794,7 @@ def write_csvs(root,result):
     write('tuning_measurement_summary.csv',result.get('measurement_summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_median_speedup_pct','paired_cv','composite_score','eligible','evidence_state','quality_reasons'])
     write('tuning_summary.csv',result.get('summary',[]),['concurrency','planned_rounds','attempted_rounds','successful_rounds','pair_completion_rate','environment_verified_pairs','environment_unverified_pairs','environment_coverage_rate','environment_coverage_ok','load_verified_pairs','load_unverified_pairs','load_coverage_rate','load_coverage_ok','success_rate','paired_baseline_median_mbps','median_mbps','baseline_variation_ratio','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','quality_reasons','evidence_state'])
     write('tuning_candidate_evidence.csv',result.get('candidate_local_evidence',[]),['concurrency','evidence_state','attempted_pairs','valid_pairs','environment_verified_pairs','environment_coverage_rate','environment_coverage_passed','load_verified_pairs','load_coverage_rate','load_coverage_passed','measurement_quality_passed','measurement_evidence_state','local_evidence_certified','reasons'])
-    write('tuning_history.csv',result.get('historical_evidence',[]),['concurrency','http_version','history_run_count','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','pair_completion_rate','success_rate','paired_median_speedup','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','evidence_state','quality_reasons','context_id'])
+    write('tuning_history.csv',result.get('historical_evidence',[]),['concurrency','http_version','history_run_count','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','pair_completion_rate','success_rate','paired_median_speedup','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','evidence_state','quality_reasons','context_id','history_expired_run_count','history_future_run_count','history_invalid_time_run_count'])
 
 
 def evidence_label(row):
@@ -802,6 +814,15 @@ def history_store_label(store):
     return status
 
 
+def history_state_label(store):
+    state=store.get('pilot_state') or {}
+    status={'CLASSIFIED':'已分层','UNSTABLE':'预探测波动过大','UNVERIFIED':'预探测状态未验证'}.get(state.get('status'),'未执行')
+    if state.get('status')=='CLASSIFIED':
+        status+=f"（{state['lower_mbps']:g} ≤ 速率 < {state['upper_mbps']:g} Mbps）"
+    age=store.get('history_max_age_seconds')
+    return status+(f"；历史窗口 {age/3600:g} 小时" if age else '')
+
+
 def report_html(result):
     esc=lambda x:html.escape(str(x if x is not None else '—'))
     labels={'concurrency':'并发数','paired_rounds':'有效配对数','pair_completion_rate':'配对完成率','paired_baseline_median_mbps':'配对基线中位 Mbps','median_mbps':'候选中位 Mbps','paired_median_speedup_pct':'配对中位提升 %','variation_ratio':'配对比值波动倍数','composite_score':'相对效用','eligible':'合格','quality_reasons':'质量原因','evidence_state':'证据状态','pair_id':'配对编号','baseline_first':'基线先测','valid':'联合有效','measurement_valid':'测量有效','environment_verified':'环境验证','reasons':'原因','baseline_mbps':'基线 Mbps','candidate_mbps':'候选 Mbps','speedup':'速度比','latency_ratio':'基线/候选 TTFB 比'}
@@ -809,17 +830,19 @@ def report_html(result):
         return '<table><tr>'+''.join('<th>'+esc(labels.get(k,k))+'</th>' for k in fields)+'</tr>'+''.join('<tr>'+''.join('<td>'+esc(r.get(k))+'</td>' for k in fields)+'</tr>' for r in rows)+'</table>'
     labels.update(verdict='证据方向',certified='局部认证',attempted_pairs='尝试配对',valid_pairs='有效配对',
                   history_valid_run_count='含有效配对的独立运行',current_run_valid_pairs='本次有效配对',
-                  http_version='HTTP 协议',attempted_rounds='累计尝试')
+                  http_version='HTTP 协议',attempted_rounds='累计尝试',
+                  history_expired_run_count='过期运行',history_future_run_count='晚于本次开始的运行',
+                  history_invalid_time_run_count='时间不可核验的运行')
     local=[dict(r,verdict=evidence_label(r),certified='通过' if r['local_evidence_certified'] else '未通过')
            for r in result.get('candidate_local_evidence',[])]
     history=[dict(r,verdict=evidence_label(r)) for r in result.get('historical_evidence',[])]
     store=result.get('history_store',{})
     validation='<h3>本次候选的局部认证</h3>'+table(local,['concurrency','attempted_pairs','valid_pairs','verdict','certified','reasons']) if local else ''
     if store:
-        validation+='<h3>跨次验证</h3><p>'+esc(history_store_label(store))+'</p>'
+        validation+='<h3>跨次验证</h3><p>'+esc(history_store_label(store))+'；'+esc(history_state_label(store))+'</p>'
         if store.get('admission_reasons'):
             validation+='<p>'+esc('、'.join(store['admission_reasons']))+'</p>'
     if history:
-        validation+=table(history,['concurrency','http_version','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','verdict','quality_reasons'])
+        validation+=table(history,['concurrency','http_version','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','history_expired_run_count','history_future_run_count','history_invalid_time_run_count','verdict','quality_reasons'])
     load_table=table(result.get('load_schedule',[]),['stage','status','waited_seconds','median_total_mbps','max_total_mbps','action'])
     return '<h2>序贯等工作量相邻配对寻优</h2><p>模式：'+esc(result.get('usage_mode'))+'；低负载窗口覆盖：'+esc(result.get('load_window_coverage_ok'))+'；共享负载观察候选：'+esc(result.get('shared_load_observation_concurrency'))+'。物理网卡总流量包含所有应用与协议，不进行进程归因。</p><p>合格子集观察候选（非全局推荐）：'+esc(result.get('qualified_subset_concurrency'))+'；独立停止记录：'+esc(result.get('eliminated_candidates'))+'。</p>'+validation+'<h3>负载感知调度</h3><p>动态阈值不超过 0.5 Mbps；测速后冷却 1 秒，再取 3 个全新非测速区间。共享模式最多等待 8 秒，受控模式最多等待 20 秒。</p>'+load_table+'<p>监测开销：'+esc(result.get('monitoring_overhead'))+'</p><p>测量证据：'+esc(result.get('measurement_evidence_level'))+'；环境证据：'+esc(result.get('environment_evidence_level'))+'；最终等级：'+esc(result.get('evidence_level'))+'；停止原因：'+esc(result.get('stop_reason'))+'；额外配对数：'+esc(result.get('extra_pairs'))+'。证据等级是工程规则，不是统计置信概率。</p><p>建议并发：'+esc(result.get('selected_concurrency'))+'；'+esc(result.get('decision_note'))+'</p><p>预探测独立，正式条件锁定：'+esc(result.get('formal_plan'))+'；正文计划上限 '+esc(result.get('requested_budget_bytes'))+' 字节；实际预留 '+esc(result.get('reserved_bytes'))+'；接收 '+esc(result.get('received_body_bytes'))+'。</p><p>效用基线为 1：配对速度比^0.65 × 完成可靠性^0.25 × 延迟惩罚^0.10。未通过质量门槛不评分。结果仅适用于当前路径及工作量。</p>'+table(result.get('summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_baseline_median_mbps','median_mbps','paired_median_speedup_pct','variation_ratio','composite_score','eligible','quality_reasons','evidence_state'])+'<h3>原始配对</h3>'+table(result.get('pairs',[]),['pair_id','baseline_first','measurement_valid','environment_verified','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio'])

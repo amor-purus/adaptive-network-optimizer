@@ -13,6 +13,7 @@ import time
 import core
 import validity
 import adaptive
+from progress import metric
 
 MIB=1024**2
 HTTPS_TARGETS=(('Cloudflare','https://speed.cloudflare.com/__down?bytes=0',0),('Google','https://www.gstatic.com/generate_204',0),('GitHub','https://api.github.com/zen',None))
@@ -154,10 +155,12 @@ def collect(stop,emit=lambda _:None,rounds=3,sample_mib=1,icmp=True,https=True):
     if rounds not in (3,5) or sample_mib not in (1,2,4):raise ValueError('性能测试配置无效')
     result=dict(https_samples=[],https_summary=[],tcp=[],icmp=[],warnings=[],plan=dict(rounds=rounds,sample_mib=sample_mib,https=https,icmp=icmp),scope='当前实际路径；可能经过代理/TUN，不能推断物理链路或直连性能。')
     for ip in IP_TARGETS:
-        core.check_cancel(stop);emit('TCP 443：'+ip)
+        core.check_cancel(stop);emit('正在测试 TCP 443：'+ip+'；计划 5 次连接')
         row=core.tcp_probe(ip,stop,rounds=5);s=stats(row['samples_ms']);row.update(p95_ms=s['p95'],jitter_ms=s['jitter_ms']);result['tcp'].append(row)
+        emit(f'TCP {ip}：成功 {row.get("success", "未提供")}/{row.get("attempted", "未提供")}；中位 {metric(row.get("median_ms"), " ms")}。' )
         if icmp:
-            emit('ICMP：'+ip);result['icmp'].append(icmp_probe(ip,stop))
+            emit('正在测试 ICMP：'+ip+'；测量应答、延迟和抖动');result['icmp'].append(icmp_probe(ip,stop))
+            row=result['icmp'][-1];emit(f'ICMP {ip}：成功 {row.get("success")}/{row.get("attempted")}；无应答率 {metric(row.get("loss_percent"), "%")}。')
     exe=curl_path()
     if https and not exe:result['warnings'].append('未找到 curl，跳过 HTTPS 测量。')
     if https and exe:
@@ -173,7 +176,9 @@ def collect(stop,emit=lambda _:None,rounds=3,sample_mib=1,icmp=True,https=True):
                     row=parse_curl('',-1,0,expected,0);row.update(error='无法执行 curl',error_category='CURL_UNAVAILABLE')
                 row.update(target=label,round=r+1,expected_bytes=expected)
                 result['https_samples'].append(row)
+                emit(f'HTTPS {label} 第 {r+1}/{rounds} 轮结束：状态 {row.get("status")}；HTTP {row.get("http_status")}；正文 {row.get("bytes",0)} 字节。')
                 if row['http_status'] in (403,429):
+                    emit(f'HTTP {row["http_status"]}：停止该目标后续测试。')
                     blocked.add(label)
                     if label.startswith('Cloudflare'):blocked.update(('Cloudflare','Cloudflare 下载'))
                 if stop.wait(.3):raise core.Cancelled()

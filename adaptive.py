@@ -40,8 +40,10 @@ def sample_download(probe,stop,emit,rounds,ceiling,clock=time.monotonic):
         nonlocal reserved,blocked
         if stop.is_set() or blocked or reserved+size>budget or clock()+REQUEST_RESERVE_SECONDS>deadline:return None
         reserved+=size
-        emit(f'下载{phase} {n}：{size//KIB} KiB')
+        name='预探测' if phase=='pilot' else ('正式测量' if n<=rounds else '补测')
+        emit(f'正在下载：{name} 第 {max(1,n)} 次，计划正文 {size//KIB} KiB')
         r=probe(size);r.update(target='Cloudflare 下载',round=n,expected_bytes=size,phase=phase)
+        emit(f'下载{name}结束：状态 {r.get("status","未提供")}；接收 {r.get("bytes",0)}/{size} 字节。')
         if r.get('http_status') in (403,429):blocked=True
         return r
     pilot=run(PILOT,'pilot',0)

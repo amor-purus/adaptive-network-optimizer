@@ -86,6 +86,7 @@ def make_result(candidate_rows, usage_mode="controlled", dns="1.1.1.1"):
             "frozen": True,
             "pilot_attempt_count": 3,
             "pilot_success_count": 3,
+            "pilot_speeds_mbps": [1.0, 1.05, 1.1],
             "total_bytes": 524288,
             "connect_timeout_seconds": 5,
             "max_time_seconds": 20,
@@ -448,6 +449,84 @@ class HistoryIntegrityTests(unittest.TestCase):
             row = next(csv.DictReader(file))
         self.assertEqual((row["history_valid_run_count"], row["paired_rounds"], row["attempted_rounds"]),
                          ("3", "7", "9"))
+
+
+class HistoryStateAndAgeTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "state.sqlite3"
+        self.now = datetime.datetime(2026, 1, 2, tzinfo=datetime.timezone.utc)
+
+    def run_at(self, speeds, seconds=0, attempts=None):
+        run, records = make_result({2: attempts if attempts is not None else [{}, {}, {}]})
+        run["started_at_utc"] = (self.now + datetime.timedelta(seconds=seconds)).isoformat()
+        run["formal_plan"]["pilot_speeds_mbps"] = speeds
+        return run, records
+
+    def save(self, run):
+        return evidence.persist_and_analyze(*run, path=self.path)
+
+    def test_fixed_band_boundary_and_pre_outcome_state(self):
+        self.assertEqual(evidence.pilot_state({"pilot_speeds_mbps": [.5, .5, .5],
+                                               "pilot_success_count": 3})["band"], -1)
+        first = self.run_at([.38, .41, .44], -1)
+        second = self.run_at([.62, .95, 1.0])
+        a, b = self.save(first), self.save(second)
+        self.assertNotEqual(a["historical_evidence"][0]["context_id"], b["historical_evidence"][0]["context_id"])
+        self.assertEqual(b["historical_evidence"][0]["history_run_count"], 1)
+        self.assertFalse(b["history_cross_run_ready"])
+        third = self.run_at([.40, .42, .46], 1)
+        c = self.save(third)
+        self.assertEqual(c["historical_evidence"][0]["history_run_count"], 2)
+        self.assertTrue(c["history_cross_run_ready"])
+
+    def test_unstable_or_unknown_pilots_are_archived_without_deleting_pairs(self):
+        for speeds, status in (([.62, .95, 1.29], "UNSTABLE"), ([], "UNVERIFIED")):
+            run = self.run_at(speeds)
+            report = self.save(run)
+            self.assertEqual(report["history_store"]["status"], "SAVED")
+            self.assertEqual(report["history_store"]["stored_pairs"], 3)
+            self.assertIn("HISTORY_PILOT_STATE_" + status, report["history_store"]["admission_reasons"])
+            self.assertFalse(report["history_cross_run_ready"])
+            self.assertEqual(report["historical_evidence"], [])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM pairs").fetchone()[0], 6)
+
+    def test_expiry_inclusive_boundary_and_future_exclusion(self):
+        speeds = [1.0, 1.05, 1.1]
+        self.save(self.run_at(speeds, -86401, [{"speedup": .7}] * 3))
+        self.save(self.run_at(speeds, -86400))
+        self.save(self.run_at(speeds, 1))
+        current = self.run_at(speeds)
+        out = self.save(current)
+        row = out["historical_evidence"][0]
+        self.assertEqual((row["history_run_count"], row["paired_rounds"]), (2, 6))
+        self.assertEqual(row["history_expired_run_count"], 1)
+        self.assertEqual(row["history_future_run_count"], 1)
+        self.assertTrue(out["history_cross_run_ready"])
+        self.assertEqual(self.save(current)["historical_evidence"], out["historical_evidence"])
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM pairs").fetchone()[0], 12)
+
+    def test_recent_failed_attempts_and_conflicts_not_filtered_by_outcome(self):
+        speeds = [1.0, 1.05, 1.1]
+        self.save(self.run_at(speeds, -2, [{"speedup": .99}] * 3))
+        self.save(self.run_at(speeds, -1, [{"valid": False}] * 3))
+        out = self.save(self.run_at(speeds))
+        row = out["historical_evidence"][0]
+        self.assertEqual((row["attempted_rounds"], row["paired_rounds"]), (9, 6))
+        self.assertIn("CONFLICTING_SESSION_DIRECTION", row["quality_reasons"])
+        self.assertIn("LOW_COMPLETION_RATE", row["quality_reasons"])
+        self.assertFalse(out["history_cross_run_ready"])
+
+    def test_naive_session_time_archived(self):
+        run = self.run_at([1.0, 1.05, 1.1])
+        run[0]["started_at_utc"] = "2026-01-02T00:00:00"
+        out = self.save(run)
+        self.assertIn("HISTORY_SESSION_TIME_UNVERIFIED", out["history_store"]["admission_reasons"])
+        self.assertEqual(out["history_store"]["stored_pairs"], 3)
+        self.assertFalse(out["history_cross_run_ready"])
 
 
 if __name__ == "__main__":

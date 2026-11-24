@@ -14,10 +14,11 @@ import performance
 import monitor
 import tuning
 import evidence
+from progress import StageProgress, metric
 
 class App:
     def __init__(self, root):
-        self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
+        self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None; self.stage_progress=None
         self.font_family=self.configure_fonts(root)
         root.title('自适应网络优化工具 '+core.VERSION); root.geometry('1050x880'); root.minsize(900,760)
         f=ttk.Frame(root,padding=22); f.pack(fill='both',expand=True)
@@ -50,16 +51,25 @@ class App:
             ttk.Checkbutton(servers,text=f'{label} {ip}',variable=v).grid(row=i//3,column=i%3,sticky='w',padx=3)
         actions=ttk.Frame(f); actions.pack(fill='x')
         self.go=ttk.Button(actions,text='开始分析与优化推荐',command=self.begin); self.go.pack(side='left')
-        self.cancel=ttk.Button(actions,text='取消',state='disabled',command=self.stop.set); self.cancel.pack(side='left',padx=8)
+        self.cancel=ttk.Button(actions,text='取消',state='disabled',command=self.request_cancel); self.cancel.pack(side='left',padx=8)
         self.open=ttk.Button(actions,text='打开 HTML 报告',state='disabled',command=self.open_report); self.open.pack(side='left')
         self.open_json_button=ttk.Button(actions,text='打开 report.json',state='disabled',command=self.open_json); self.open_json_button.pack(side='left',padx=(8,0))
         self.open_folder_button=ttk.Button(actions,text='打开报告文件夹',state='disabled',command=self.open_folder); self.open_folder_button.pack(side='left',padx=(8,0))
-        self.status=tk.StringVar(value='就绪'); ttk.Label(f,textvariable=self.status,wraplength=950,font=(self.font_family,10)).pack(anchor='w',pady=14)
+        self.progress_text=tk.StringVar(value='阶段进度：就绪')
+        ttk.Label(f,textvariable=self.progress_text,wraplength=850,font=(self.font_family,10,'bold')).pack(anchor='w',pady=(12,4))
+        self.progressbar=ttk.Progressbar(f,mode='determinate',maximum=1,value=0)
+        self.progressbar.pack(fill='x')
+        self.status=tk.StringVar(value='就绪'); ttk.Label(f,textvariable=self.status,wraplength=850,font=(self.font_family,10)).pack(anchor='w',pady=(4,8))
         self.table=ttk.Treeview(f,columns=('name','server','success','median','p95','current'),show='headings',height=8)
         for k,t,w in [('name','DNS 服务',140),('server','服务器',115),('success','成功/计划',90),('median','中位 ms',85),('p95','P95 ms',85),('current','当前配置',90)]:
             self.table.heading(k,text=t); self.table.column(k,width=w,anchor='center')
         self.table.pack(fill='both',expand=True)
-        self.logbox=tk.Text(f,height=8,wrap='word',state='disabled',font=(self.font_family,10),padx=9,pady=7,spacing1=3,spacing3=3); self.logbox.pack(fill='x',pady=(12,0))
+        ttk.Label(f,text='实时执行日志（最近 1500 行，可滚动查看）',font=(self.font_family,10,'bold')).pack(anchor='w',pady=(8,2))
+        logframe=ttk.Frame(f); logframe.pack(fill='both',expand=True)
+        self.logbox=tk.Text(logframe,height=8,wrap='word',state='disabled',font=(self.font_family,10),padx=9,pady=7,spacing1=3,spacing3=3)
+        scrollbar=ttk.Scrollbar(logframe,orient='vertical',command=self.logbox.yview)
+        self.logbox.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right',fill='y'); self.logbox.pack(side='left',fill='both',expand=True)
         root.after(100,self.poll); root.protocol('WM_DELETE_WINDOW',self.close)
     @staticmethod
     def configure_fonts(root):
@@ -82,7 +92,22 @@ class App:
         style.configure('Treeview.Heading',font=(family,10,'bold'),padding=(7,8))
         return family
     def log(self,s):
-        self.logbox.config(state='normal'); self.logbox.insert('end',s+'\n'); self.logbox.see('end'); self.logbox.config(state='disabled')
+        self.logbox.config(state='normal')
+        follow=self.logbox.yview()[1]>=.999
+        self.logbox.insert('end',datetime.datetime.now().strftime('[%H:%M:%S] ')+s+'\n')
+        lines=int(self.logbox.index('end-1c').split('.')[0])-1
+        if lines>1500:self.logbox.delete('1.0',f'{lines-1500+1}.0')
+        if follow:self.logbox.see('end')
+        self.logbox.config(state='disabled')
+    def refresh_progress(self):
+        p=self.stage_progress
+        if p is not None:
+            self.progressbar.configure(maximum=p.total,value=p.completed)
+            self.progress_text.set(p.label())
+    def request_cancel(self):
+        self.stop.set()
+        self.cancel.config(state='disabled')
+        self.status.set('已请求取消；等待当前有超时限制的任务结束…')
     def begin(self):
         if self.busy:return
         try:
@@ -96,49 +121,70 @@ class App:
         tuning_budget=tuning.maximum_budget_bytes(rounds,tuning.CONCURRENCY_LEVELS)/(1024**2) if tune else 0
         if not messagebox.askyesno('确认测量',f'将查询所选 DNS，测试多个公网目标的连接。HTTPS 下载样本计划上限 {sample*(rounds+2)+0.125 if https else 0} MiB（含预探测和最多两次补测），并发寻优额外正文预算最坏约 {tuning_budget:.1f} MiB（含三次预探测与最多四组追加配对）；另有小请求、协议及错误开销（非硬流量上限）。服务商可能记录请求；不会修改系统设置。继续？'):return
         self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.open_json_button.config(state='disabled'); self.open_folder_button.config(state='disabled'); self.report=None
+        self.stage_progress=StageProgress(mtu,tune); self.refresh_progress()
+        self.status.set('正在准备实验…')
+        self.logbox.config(state='normal'); self.logbox.delete('1.0','end'); self.logbox.config(state='disabled')
+        self.log('开始新实验；模式：'+('受控' if usage_mode=='controlled' else '共享')+f'；计划 {rounds} 轮。')
         for item in self.table.get_children():self.table.delete(item)
         def task():
             warnings=[]; snap={}; current={}; observer=monitor.Monitor()
             def emit(s):self.queue.put(('progress',s))
+            def stage(key, detail):
+                self.queue.put(('stage',key)); emit(detail)
             try:
-                emit('读取网卡、路由及 DNS 配置…')
+                stage('configuration','读取网卡、路由及 DNS 配置…')
                 try:snap=observer.checkpoint('start'); current=core.current_servers(snap); observer.start()
                 except (core.ProbeError,OSError,ValueError) as e:warnings.append('读取系统配置失败，当前 DNS 未纳入比较。')
                 for ip,names in current.items():servers[ip]=servers.get(ip,'当前 DNS')
                 if not servers:raise core.ProbeError('没有候选 DNS。')
                 if len(servers)>20:raise core.ProbeError('候选超过 20 个，停止以限制请求。')
+                emit(f'配置读取结束：网卡记录 {len(snap.get("interfaces",[]))} 条；路由 {len(snap.get("routes",[]))} 条；DNS 候选 {len(servers)} 个。')
+                stage('dns',f'正在测试 DNS：{len(servers)} 个服务器 × {len(domains)} 个域名 × {rounds} 轮。')
                 rows=core.dns_benchmark(servers,domains,rounds,self.stop,emit)
-                emit('验证实验有效性并重新读取网络配置…')
+                stage('dns_validation','验证实验有效性并重新读取网络配置…')
                 after={}
                 try:after=observer.checkpoint('after_dns','performance')
                 except (core.ProbeError,OSError,ValueError):warnings.append('无法取得实验后网络快照。')
                 gate=monitor.apply_dns_gate(validity.assess(rows,snap,after,current),observer.evidence('dns'))
                 summary,choice,note=core.summarize_dns(rows,servers,domains,rounds,current,gate)
                 warnings.extend(gate['messages'])
+                emit('DNS 有效性检查结束：'+('允许推荐' if gate.get('recommendation_allowed') else '不允许推荐')+'；'+note)
                 warnings.append('VPN/代理、DoH、IPv6 DNS、分流及 CDN 可能使真实体验不同；不应仅凭 DNS 延迟变更系统。')
-                emit('采集实际网络传输性能…')
+                stage('performance','采集实际网络传输性能…')
                 perf=performance.collect(self.stop,emit,rounds,sample,icmp,https)
+                emit(f'实际性能采集结束：TCP {len(perf["tcp"])} 个目标；ICMP {len(perf["icmp"])} 个目标；HTTPS {len(perf["https_samples"])} 条样本。')
                 tcp=perf['tcp']
                 mt=None
                 if mtu:
+                    stage('mtu','正在探测 MTU…')
                     try:mt=core.mtu_probe(target,self.stop,emit)
                     except (OSError,subprocess.SubprocessError,core.ProbeError):warnings.append('MTU 探测无法运行；DNS 和 TCP 结果仍保留。')
                 core.check_cancel(self.stop)
+                stage('baseline','正在验证性能实验及环境快照…')
                 final_snap={}
                 try:final_snap=observer.checkpoint('after_performance','tuning' if tune else 'done')
                 except (core.ProbeError,OSError,ValueError):warnings.append('无法取得性能实验后网络快照。')
                 base=monitor.apply_baseline(performance.baseline(perf,after,final_snap),observer.evidence('performance'))
                 tuning_result=dict(status='Disabled',selected_concurrency=None,comparison_ready=False,recommendation_allowed=False,decision='DISABLED',decision_note='用户未启用并发寻优。',batches=[],summary=[],requested_budget_bytes=0,reserved_bytes=0)
                 if tune:
-                    emit('执行下载并发度自动寻优（1 / 2 / 4 / 8）…')
+                    stage('tuning','执行下载并发度自动寻优（1 / 2 / 4 / 8）…')
                     tuning_result=tuning.run(self.stop,emit,exe=performance.curl_path(),rounds=rounds,observer=observer,usage_mode=usage_mode)
+                    stage('history','正在认证环境与历史证据…')
                     try:observer.checkpoint('after_tuning','done')
                     except (core.ProbeError,OSError,ValueError):warnings.append('无法取得并发寻优结束时网络快照。')
+                    emit('正在检查全局配置、预探测及每个候选的环境和负载覆盖。')
                     tuning_result=tuning.apply_environment_gate(tuning_result,observer.evidence('tuning'))
+                    for row in tuning_result.get('candidate_local_evidence',[]):
+                        emit(f'{row["concurrency"]} 路局部认证：'+('通过' if row['local_evidence_certified'] else '未通过')+f'；有效配对 {row["valid_pairs"]}/{row["attempted_pairs"]}；原因 '+('、'.join(row.get('reasons',[])) or '无'))
+                    emit('正在写入历史证据库，检查预探测分层、独立运行及 24 小时窗口。')
                     history=evidence.persist_and_analyze(tuning_result,observer.records)
+                    emit('历史证据库：'+tuning.history_store_label(history.get('history_store',{}))+'；'+tuning.history_state_label(history.get('history_store',{})))
                     tuning_result=tuning.apply_history_evidence(tuning_result,history)
+                    for row in tuning_result.get('historical_evidence',[]):
+                        emit(f'{row["concurrency"]} 路历史认证：{tuning.evidence_label(row)}；独立运行 {row["history_valid_run_count"]}；过期运行 {row.get("history_expired_run_count",0)}。')
                     tuning_result['monitoring_overhead']=observer.overhead(tuning_result.get('pilots',[])+tuning_result.get('batches',[]))
                     tuning_result['load_monitor']=observer.load_evidence()
+                stage('diagnostics','整理环境记录、IPv6 及防火墙配置旁证…')
                 observer.close()
                 if tune:tuning_result['load_monitor']=observer.load_evidence()
                 phases=[observer.evidence('dns'),observer.evidence('performance')]
@@ -148,9 +194,10 @@ class App:
                 core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
                 data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':core.VERSION,'snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                stage('export','正在生成 HTML、JSON 和 CSV 报告…')
                 directory=core.new_report_directory()
-                report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
-            except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
+                report=core.save_report(directory,data,emit=emit); self.queue.put(('result',(data,report)))
+            except core.Cancelled:self.queue.put(('cancelled','已取消；未完成的实验不生成推荐。'))
             except Exception as e:self.queue.put(('error',str(e) if isinstance(e,core.ProbeError) else '测量失败：'+type(e).__name__))
             finally:
                 observer.close();self.queue.put(('done',None))
@@ -165,14 +212,21 @@ class App:
         try:
             while True:
                 kind,data=self.queue.get_nowait()
-                if kind=='progress':self.status.set(data)
-                elif kind=='error':self.status.set(data);self.log(data)
+                if kind=='stage':
+                    self.stage_progress.enter(data); self.refresh_progress()
+                elif kind=='progress':
+                    self.log(data)
+                    if not self.stop.is_set():self.status.set(data)
+                elif kind in ('error','cancelled'):
+                    self.stage_progress.abort(cancelled=kind=='cancelled'); self.refresh_progress()
+                    self.status.set(data);self.log(data)
                 elif kind=='result':
                     result,self.report=data
+                    self.stage_progress.finish(); self.refresh_progress()
                     for r in result['dns_summary']:
                         self.table.insert('','end',values=(r['name'],r['server'],f"{r['success']}/{r['planned']}",r['median_ms'] if r['median_ms'] is not None else '—',r['p95_ms'] if r['p95_ms'] is not None else '—','是' if r['current'] else '否'))
                     choice=result['recommendation']; msg='推荐 DNS 候选：'+choice['server'] if choice else '无可靠 DNS 推荐'
-                    self.status.set(msg); self.log(msg); self.log(result['note'])
+                    self.status.set('分析完成；报告已保存。'+msg); self.log(msg); self.log(result['note'])
                     self.log('实验环境：'+result['validity']['environment']+'；'+result['validity']['scope'])
                     for h in result['performance']['https_summary']:
                         self.log(f"HTTPS {h['target']}：{h['success']}/{h['planned']}，TTFB {h['ttfb_median_ms']} ms，有效速度 {h['effective_mbps_median']} Mbps")
@@ -185,6 +239,7 @@ class App:
                         verdict=tuning.evidence_label(row) if row['local_evidence_certified'] else '局部认证未通过'
                         self.log(f"{row['concurrency']} 路对比 1 路：{verdict}，有效配对 {row['valid_pairs']}/{row['attempted_pairs']}。")
                     self.log('历史证据库：'+tuning.history_store_label(tune.get('history_store',{})))
+                    self.log('历史性能状态：'+tuning.history_state_label(tune.get('history_store',{})))
                     for row in tune.get('historical_evidence',[]):
                         self.log(f"跨次验证 {row['concurrency']} 路：{tuning.evidence_label(row)}，{row['history_valid_run_count']} 次运行提供了 {row['paired_rounds']} 个有效配对。")
                     self.log('下载质量：'+str(result['performance'].get('download_experiment',{}).get('quality',{})))
@@ -198,7 +253,7 @@ class App:
         except queue.Empty:pass
         self.root.after(100,self.poll)
     def close(self):
-        if self.busy:self.stop.set();messagebox.showinfo('取消','请等待当前有超时限制的探测返回，再关闭窗口。')
+        if self.busy:self.request_cancel();messagebox.showinfo('取消','请等待当前有超时限制的探测返回，再关闭窗口。')
         else:self.root.destroy()
 
 if __name__=='__main__':
