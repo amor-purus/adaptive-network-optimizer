@@ -640,7 +640,9 @@ def apply_environment_gate(result,evidence):
     result['candidate_local_evidence']=local_rows
     result['pair_environment_coverage_ok']=bool(local_rows and all(x['environment_coverage_passed'] for x in local_rows))
     result['candidate_load_coverage_ok']=bool(local_rows and all(x['load_coverage_passed'] for x in local_rows))
-    result['recommendation_allowed']=bool(global_ok and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
+    result['recommendation_allowed']=bool(global_ok and result.get('comparison_ready') and
+        result.get('pair_environment_coverage_ok') and result.get('candidate_load_coverage_ok') and
+        result.get('provisional_concurrency') is not None)
     result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
     result['traffic_coverage']=dict(batches=len(result.get('pilots',[]))+len(result.get('batches',[])),measured=sum(b.get('traffic',{}).get('status')=='Measured' for b in result.get('pilots',[])+result.get('batches',[])))
     subset=set(result.get('qualified_subset_candidates',[]))-{1}
