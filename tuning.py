@@ -217,6 +217,12 @@ def summarize_pairs(pairs,candidates,rounds):
         n=len(rows); success=len(good); completion=success/n if n else 0
         planned=sum(p['candidate_planned'] for p in rows); succeeded=sum(p['candidate_success'] for p in rows)
         request_rate=succeeded/planned if planned else 0
+        env_verified=sum(p.get('environment_verified') is True for p in rows)
+        load_verified=sum(p.get('load_window_verified') is True for p in rows)
+        env_coverage=env_verified/n if n else 0
+        load_coverage=load_verified/n if n else 0
+        env_coverage_ok=env_verified>=rounds and env_coverage>=.75
+        load_coverage_ok=load_verified>=rounds and load_coverage>=.75
         reasons=[]
         if len([p for p in rows if not p['retest']])!=rounds:reasons.append('INCOMPLETE_FORMAL_PAIRS')
         if len(set(p['pair_id'] for p in rows))!=n:reasons.append('DUPLICATE_PAIR')
@@ -235,8 +241,11 @@ def summarize_pairs(pairs,candidates,rounds):
         # Relative utility, baseline=1. Monotonic in speed, no artificial twofold cap.
         score=ratio**.65*reliability**.25*min(1,latency)**.10 if ratio and latency and reliability else None
         result.append(dict(concurrency=c,planned_rounds=rounds,attempted_rounds=n,successful_rounds=success,
-                           environment_verified_pairs=sum(p.get('environment_verified') is True for p in rows),
-                           environment_unverified_pairs=sum(p.get('environment_verified') is False for p in rows),
+                           environment_verified_pairs=env_verified,
+                           environment_unverified_pairs=n-env_verified,
+                           environment_coverage_rate=env_coverage,environment_coverage_ok=env_coverage_ok,
+                           load_verified_pairs=load_verified,load_unverified_pairs=n-load_verified,
+                           load_coverage_rate=load_coverage,load_coverage_ok=load_coverage_ok,
                            paired_rounds=success,pair_completion_rate=completion,success_rate=request_rate,
                            success_requests=succeeded,planned_requests=planned,
                            median_mbps=statistics.median(rates) if rates else None,
@@ -324,7 +333,8 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
                 measurement_summary=[],pilot_environment=None,pair_monitoring_enabled=observer is not None,
                 usage_mode=usage_mode,load_attribution='UNAVAILABLE',boundary_budget_trace=[],
                 load_scheduler_enabled=callable(getattr(observer,'start_load_sampler',None)),load_schedule=[],
-                load_window_coverage_ok=False,load_policy=dict(threshold_mbps=0.5,threshold_cap_mbps=0.5,adaptive=True,cooldown_seconds=1.0,baseline_min_intervals=8,stable_intervals=3,sample_interval_seconds=1.0,shared_wait_seconds=8,controlled_wait_seconds=20),
+                load_window_coverage_ok=False,pilot_load_coverage_ok=False,candidate_load_coverage_ok=False,
+                load_policy=dict(threshold_mbps=0.5,threshold_cap_mbps=0.5,adaptive=True,cooldown_seconds=1.0,baseline_min_intervals=8,stable_intervals=3,sample_interval_seconds=1.0,shared_wait_seconds=8,controlled_wait_seconds=20),
                 eliminated_candidates=[],qualified_subset_concurrency=None,qualified_subset_candidates=[],
                 retest_status='NotNeeded',retest_candidate=None,blocked=False,comparison_ready=False,
                 recommendation_allowed=False,selected_concurrency=None,provisional_concurrency=None,
@@ -544,14 +554,15 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     raw_summary=annotate(summarize_pairs(raw_pairs,plan['candidates'],rounds),rounds)
     result['measurement_summary']=raw_summary
     pilot_load_ok=(not result['load_scheduler_enabled']) or (len(result['pilots'])==PILOT_COUNT and all(p.get('load_window_verified') for p in result['pilots']))
-    pair_load_ok=(not result['load_scheduler_enabled']) or (bool(result['pairs']) and all(p.get('load_window_verified') for p in result['pairs']))
+    pair_load_ok=bool(summary) and all(s.get('load_coverage_ok') for s in summary)
+    result['pilot_load_coverage_ok']=bool(pilot_load_ok)
+    result['candidate_load_coverage_ok']=bool(pair_load_ok)
     result['load_window_coverage_ok']=bool(pilot_load_ok and pair_load_ok and complete)
     raw_decision=decide(raw_summary,complete,result['blocked'])
     raw_resolved=bool(raw_summary) and all(s['evidence_state'] in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN') for s in raw_summary)
     result['measurement_evidence_level']=('SUPPORTED_WITHIN_TESTED_SCOPE' if raw_resolved and raw_decision['comparison_ready'] and len(plan['pilot_speeds_mbps'])>=2 else 'TENTATIVE' if raw_decision['comparison_ready'] else 'INSUFFICIENT')
     result['measurement_provisional_concurrency']=raw_decision['provisional_concurrency']
-    result['pair_environment_coverage_ok']=bool(observer is not None and summary and all(
-        s['environment_verified_pairs']>=rounds and s['environment_verified_pairs']/max(1,s['attempted_rounds'])>=.75 for s in summary))
+    result['pair_environment_coverage_ok']=bool(observer is not None and summary and all(s.get('environment_coverage_ok') for s in summary))
     result['environment_evidence_level']='PAIR_COVERAGE_MET' if result['pair_environment_coverage_ok'] else 'INSUFFICIENT' if observer is not None else 'UNVERIFIED'
     states=[s['evidence_state'] for s in summary]
     resolved=bool(states) and all(s in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN') for s in states)
@@ -570,7 +581,8 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     if qualified and complete and not result['blocked']:
         result['qualified_subset_concurrency']=decide(qualified)['provisional_concurrency']
     result.update(decide(summary,complete,result['blocked']))
-    if result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2 and result['load_window_coverage_ok']:
+    if (result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2
+        and result['load_window_coverage_ok'] and result['pair_environment_coverage_ok']):
         result['evidence_level']='SUPPORTED_WITHIN_TESTED_SCOPE'
     elif result['comparison_ready']:
         result['evidence_level']='TENTATIVE'
@@ -587,28 +599,60 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
 def apply_environment_gate(result,evidence):
     result=dict(result)
     result['environment_evidence']=evidence
-    # Global configuration and adapter state are still hard constraints. Radio tolerances
-    # are evaluated inside each pair, not against an unrelated pilot or between-pair sample.
+    # Global guard: configuration integrity, adapter state and the three calibration pilots.
+    # Candidate pair failures are evaluated only inside that candidate's local evidence gate.
     global_state_changes=[c for c in evidence.get('telemetry_changes',[]) if c.get('field') in ('Status','MediaConnectionState')]
     native_changes=[dict(pair_id=b.get('pair_id'),pilot_index=b.get('pilot_index'),index=r.get('index'),reason=r.get('reason')) for b in result.get('pilots',[])+result.get('batches',[]) for r in b.get('traffic',{}).get('interfaces',[]) if r.get('reason') in ('INTERFACE_IDENTITY_CHANGED','INTERFACE_STATE_CHANGED')]
     result['native_state_changes']=native_changes
-    load_ok=(not result.get('load_scheduler_enabled')) or bool(result.get('load_window_coverage_ok'))
-    result['load_environment_guard_passed']=load_ok
-    global_ok=bool(evidence.get('complete') and evidence.get('observed_stable') and evidence.get('adapter_state_coverage') and not global_state_changes and not native_changes and load_ok)
-    stable=bool(global_ok and result.get('pair_environment_coverage_ok'))
+    pilot_load_ok=(not result.get('load_scheduler_enabled')) or bool(result.get('pilot_load_coverage_ok'))
+    result['pilot_load_environment_guard_passed']=pilot_load_ok
+    global_ok=bool(evidence.get('complete') and evidence.get('observed_stable') and
+                   evidence.get('adapter_state_coverage') and not global_state_changes and
+                   not native_changes and pilot_load_ok)
     result['global_environment_guard_passed']=global_ok
-    result['environment_stable']=stable
-    result['environment_evidence_level']='VERIFIED_PAIR_SCOPE' if stable else 'INSUFFICIENT'
+    result['global_environment_stable']=global_ok
+    result['environment_stable']=global_ok
+    result['environment_evidence_level']='GLOBAL_GUARD_PASSED' if global_ok else 'INSUFFICIENT'
     result['measurement_comparison_ready']=result.get('measurement_evidence_level')=='SUPPORTED_WITHIN_TESTED_SCOPE'
     result['combined_comparison_ready_before_global_gate']=bool(result.get('comparison_ready'))
-    result['recommendation_allowed']=bool(stable and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
+
+    local_rows=[]
+    for s in result.get('summary',[]):
+        supported=s.get('evidence_state') in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN')
+        env_ok=bool(s.get('environment_coverage_ok'))
+        load_ok=bool(s.get('load_coverage_ok'))
+        reasons=list(s.get('quality_reasons',[]))
+        if not env_ok:reasons.append('LOCAL_ENVIRONMENT_COVERAGE_INSUFFICIENT')
+        if not load_ok:reasons.append('LOCAL_LOAD_COVERAGE_INSUFFICIENT')
+        local_rows.append(dict(
+            concurrency=s.get('concurrency'),
+            evidence_state=s.get('evidence_state'),
+            attempted_pairs=s.get('attempted_rounds',0),
+            valid_pairs=s.get('paired_rounds',0),
+            environment_verified_pairs=s.get('environment_verified_pairs',0),
+            environment_coverage_rate=s.get('environment_coverage_rate',0),
+            environment_coverage_passed=env_ok,
+            load_verified_pairs=s.get('load_verified_pairs',0),
+            load_coverage_rate=s.get('load_coverage_rate',0),
+            load_coverage_passed=load_ok,
+            measurement_quality_passed=supported,
+            local_evidence_certified=bool(supported and env_ok and load_ok),
+            reasons=sorted(set(reasons))))
+    result['candidate_local_evidence']=local_rows
+    result['pair_environment_coverage_ok']=bool(local_rows and all(x['environment_coverage_passed'] for x in local_rows))
+    result['candidate_load_coverage_ok']=bool(local_rows and all(x['load_coverage_passed'] for x in local_rows))
+    result['recommendation_allowed']=bool(global_ok and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
     result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
     result['traffic_coverage']=dict(batches=len(result.get('pilots',[]))+len(result.get('batches',[])),measured=sum(b.get('traffic',{}).get('status')=='Measured' for b in result.get('pilots',[])+result.get('batches',[])))
     subset=set(result.get('qualified_subset_candidates',[]))-{1}
     subset_rows=[s for s in result.get('summary',[]) if s['concurrency'] in subset]
     subset_coverage=bool(subset and {s['concurrency'] for s in subset_rows}==subset and all(
-        s['environment_verified_pairs']>=s['planned_rounds'] and s['environment_verified_pairs']/max(1,s['attempted_rounds'])>=.75 for s in subset_rows))
+        s.get('environment_coverage_ok') and s.get('load_coverage_ok') and
+        s.get('evidence_state') in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN') for s in subset_rows))
     result['qualified_subset_environment_verified']=bool(global_ok and subset_coverage and result.get('qualified_subset_concurrency') is not None)
+    result['qualified_subset_locally_certified']=[s['concurrency'] for s in subset_rows if
+        s.get('environment_coverage_ok') and s.get('load_coverage_ok') and
+        s.get('evidence_state') in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN')]
     result['shared_load_observation_concurrency']=None
     if result.get('usage_mode')=='shared' and result['recommendation_allowed']:
         result['shared_load_observation_concurrency']=result['selected_concurrency']
@@ -618,12 +662,55 @@ def apply_environment_gate(result,evidence):
         result['evidence_level']='TENTATIVE'
         result['decision']='SHARED_LOAD_OBSERVATION_ONLY'
         result['decision_note']='日常使用模式：共享负载下的观察方向，不是受控参数推荐。'
-    if not stable:
+    if not global_ok:
         result['evidence_level']='INSUFFICIENT'
         result['comparison_ready']=False
         if result.get('decision') not in ('HTTP_BLOCKED','CURL_UNAVAILABLE','INCOMPLETE_EXPERIMENT'):
             result['decision']='ENVIRONMENT_UNSTABLE_OR_UNVERIFIED'
-            result['decision_note']='全局配置/连接状态或局部配对环境覆盖不足；保留测量证据，不推荐。'
+            result['decision_note']='全局配置、连接状态或预探测负载门槛未通过；保留各候选局部证据，不推荐。'
+    return result
+
+
+def apply_history_evidence(result,history):
+    """Use compatible cross-run evidence only after every candidate independently passes the unchanged quality gates."""
+    result=dict(result)
+    history=history if isinstance(history,dict) else {}
+    result.update(history)
+    rows=result.get('historical_evidence',[])
+    result['history_comparison_ready']=False
+    result['history_provisional_concurrency']=None
+    result['history_composite_score']=None
+    if not result.get('history_cross_run_ready'):
+        return result
+    expected={c for c in result.get('candidates',[]) if c>1}
+    actual={r.get('concurrency') for r in rows}
+    if not expected or actual!=expected:
+        return result
+    decision=decide(rows,complete=True,blocked=result.get('blocked',False))
+    result['history_comparison_ready']=bool(decision.get('comparison_ready'))
+    result['history_provisional_concurrency']=decision.get('provisional_concurrency')
+    result['history_composite_score']=decision.get('composite_score')
+    result['history_decision']=decision.get('decision')
+    result['history_decision_note']=decision.get('decision_note')
+    if not decision.get('comparison_ready'):
+        return result
+    if result.get('usage_mode')=='shared':
+        result['shared_load_observation_concurrency']=decision.get('provisional_concurrency')
+        result['history_evidence_level']='OBSERVATIONAL_ONLY'
+        return result
+    if (result.get('recommendation_allowed') or not result.get('global_environment_guard_passed') or
+        result.get('status')!='Completed' or result.get('blocked')):
+        return result
+    result['comparison_ready']=True
+    result['provisional_concurrency']=decision.get('provisional_concurrency')
+    result['composite_score']=decision.get('composite_score')
+    result['recommendation_allowed']=result['provisional_concurrency'] is not None
+    result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
+    result['evidence_level']='SUPPORTED_ACROSS_SESSIONS'
+    result['history_evidence_level']='SUPPORTED_ACROSS_SESSIONS'
+    result['evidence_source']='CROSS_RUN_HISTORY'
+    result['decision']='CROSS_RUN_'+str(decision.get('decision'))
+    result['decision_note']='跨次实验在相同网络配置指纹、路径、工作量和质量策略下积累了足够证据；所有当前候选均通过独立局部质量门槛，且全局环境门槛通过。'
     return result
 
 
@@ -646,7 +733,9 @@ def write_csvs(root,result):
     pair_rows=[dict(p,environment_reasons=p.get('environment',{}).get('reasons'),environment_begin_index=p.get('environment',{}).get('begin_index'),environment_end_index=p.get('environment',{}).get('end_index'),load_window_status=p.get('load_window',{}).get('status'),load_wait_seconds=p.get('load_window',{}).get('waited_seconds')) for p in result.get('pairs',[])]
     write('tuning_pairs.csv',pair_rows,['pair_id','concurrency','round','retest','baseline_first','valid','reasons','measurement_valid','measurement_reasons','environment_verified','environment_reasons','environment_begin_index','environment_end_index','load_window_status','load_wait_seconds','baseline_mbps','candidate_mbps','baseline_elapsed_s','candidate_elapsed_s','speedup','latency_ratio','baseline_success','baseline_planned','candidate_success','candidate_planned','http_version'])
     write('tuning_measurement_summary.csv',result.get('measurement_summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_median_speedup_pct','paired_cv','composite_score','eligible','evidence_state','quality_reasons'])
-    write('tuning_summary.csv',result.get('summary',[]),['concurrency','planned_rounds','attempted_rounds','successful_rounds','pair_completion_rate','environment_verified_pairs','environment_unverified_pairs','success_rate','paired_baseline_median_mbps','median_mbps','baseline_variation_ratio','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','quality_reasons','evidence_state'])
+    write('tuning_summary.csv',result.get('summary',[]),['concurrency','planned_rounds','attempted_rounds','successful_rounds','pair_completion_rate','environment_verified_pairs','environment_unverified_pairs','environment_coverage_rate','environment_coverage_ok','load_verified_pairs','load_unverified_pairs','load_coverage_rate','load_coverage_ok','success_rate','paired_baseline_median_mbps','median_mbps','baseline_variation_ratio','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','quality_reasons','evidence_state'])
+    write('tuning_candidate_evidence.csv',result.get('candidate_local_evidence',[]),['concurrency','evidence_state','attempted_pairs','valid_pairs','environment_verified_pairs','environment_coverage_rate','environment_coverage_passed','load_verified_pairs','load_coverage_rate','load_coverage_passed','measurement_quality_passed','local_evidence_certified','reasons'])
+    write('tuning_history.csv',result.get('historical_evidence',[]),['concurrency','history_run_count','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','pair_completion_rate','success_rate','paired_median_speedup','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','evidence_state','quality_reasons','context_id'])
 
 
 def report_html(result):
