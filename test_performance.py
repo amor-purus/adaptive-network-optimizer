@@ -71,6 +71,12 @@ class PerformanceTests(unittest.TestCase):
         row=p.parse_curl(GOOD.replace('200|','429|'),0,1000000,1000000,1000000)
         with patch('core.tcp_probe',return_value=dict(samples_ms=[1]*5)),patch('performance.curl_path',return_value='curl'),patch('performance.https_probe',return_value=None,side_effect=lambda *a:dict(row)) as mock:
             r=p.collect(threading.Event(),icmp=False);self.assertEqual(mock.call_count,3);self.assertEqual(len(r['https_summary']),4)
+    def test_missing_tcp_metrics_do_not_interrupt_progress(self):
+        messages=[]
+        with patch('core.tcp_probe',return_value=dict(samples_ms=[1]*5)),patch('performance.curl_path',return_value=None):
+            result=p.collect(threading.Event(),emit=messages.append,icmp=False)
+        self.assertEqual(len(result['tcp']),6)
+        self.assertTrue(any('未提供/未提供' in line and '未测得' in line for line in messages))
     def test_report(self):
         with tempfile.TemporaryDirectory() as d:
             perf=dict(scope='<script>',https_samples=[],https_summary=[],tcp=[],icmp=[],warnings=[])

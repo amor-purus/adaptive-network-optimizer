@@ -13,6 +13,7 @@ import time
 import core
 import validity
 import adaptive
+from progress import metric
 
 MIB=1024**2
 HTTPS_TARGETS=(('Cloudflare','https://speed.cloudflare.com/__down?bytes=0',0),('Google','https://www.gstatic.com/generate_204',0),('GitHub','https://api.github.com/zen',None))
@@ -156,10 +157,10 @@ def collect(stop,emit=lambda _:None,rounds=3,sample_mib=1,icmp=True,https=True):
     for ip in IP_TARGETS:
         core.check_cancel(stop);emit('正在测试 TCP 443：'+ip+'；计划 5 次连接')
         row=core.tcp_probe(ip,stop,rounds=5);s=stats(row['samples_ms']);row.update(p95_ms=s['p95'],jitter_ms=s['jitter_ms']);result['tcp'].append(row)
-        emit(f'TCP {ip}：成功 {row["success"]}/{row["attempted"]}；中位 {row["median_ms"] if row["median_ms"] is not None else "未测得"} ms。')
+        emit(f'TCP {ip}：成功 {row.get("success", "未提供")}/{row.get("attempted", "未提供")}；中位 {metric(row.get("median_ms"), " ms")}。' )
         if icmp:
             emit('正在测试 ICMP：'+ip+'；测量应答、延迟和抖动');result['icmp'].append(icmp_probe(ip,stop))
-            row=result['icmp'][-1];emit(f'ICMP {ip}：成功 {row.get("success")}/{row.get("attempted")}；无应答率 {row.get("loss_percent")}%。')
+            row=result['icmp'][-1];emit(f'ICMP {ip}：成功 {row.get("success")}/{row.get("attempted")}；无应答率 {metric(row.get("loss_percent"), "%")}。')
     exe=curl_path()
     if https and not exe:result['warnings'].append('未找到 curl，跳过 HTTPS 测量。')
     if https and exe:
