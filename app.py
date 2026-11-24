@@ -14,7 +14,7 @@ import performance
 import monitor
 import tuning
 import evidence
-from progress import StageProgress
+from progress import StageProgress, metric
 
 class App:
     def __init__(self, root):
@@ -64,7 +64,12 @@ class App:
         for k,t,w in [('name','DNS 服务',140),('server','服务器',115),('success','成功/计划',90),('median','中位 ms',85),('p95','P95 ms',85),('current','当前配置',90)]:
             self.table.heading(k,text=t); self.table.column(k,width=w,anchor='center')
         self.table.pack(fill='both',expand=True)
-        self.logbox=tk.Text(f,height=8,wrap='word',state='disabled',font=(self.font_family,10),padx=9,pady=7,spacing1=3,spacing3=3); self.logbox.pack(fill='x',pady=(12,0))
+        ttk.Label(f,text='实时执行日志（最近 1500 行，可滚动查看）',font=(self.font_family,10,'bold')).pack(anchor='w',pady=(8,2))
+        logframe=ttk.Frame(f); logframe.pack(fill='both',expand=True)
+        self.logbox=tk.Text(logframe,height=8,wrap='word',state='disabled',font=(self.font_family,10),padx=9,pady=7,spacing1=3,spacing3=3)
+        scrollbar=ttk.Scrollbar(logframe,orient='vertical',command=self.logbox.yview)
+        self.logbox.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right',fill='y'); self.logbox.pack(side='left',fill='both',expand=True)
         root.after(100,self.poll); root.protocol('WM_DELETE_WINDOW',self.close)
     @staticmethod
     def configure_fonts(root):
@@ -87,7 +92,13 @@ class App:
         style.configure('Treeview.Heading',font=(family,10,'bold'),padding=(7,8))
         return family
     def log(self,s):
-        self.logbox.config(state='normal'); self.logbox.insert('end',s+'\n'); self.logbox.see('end'); self.logbox.config(state='disabled')
+        self.logbox.config(state='normal')
+        follow=self.logbox.yview()[1]>=.999
+        self.logbox.insert('end',datetime.datetime.now().strftime('[%H:%M:%S] ')+s+'\n')
+        lines=int(self.logbox.index('end-1c').split('.')[0])-1
+        if lines>1500:self.logbox.delete('1.0',f'{lines-1500+1}.0')
+        if follow:self.logbox.see('end')
+        self.logbox.config(state='disabled')
     def refresh_progress(self):
         p=self.stage_progress
         if p is not None:
@@ -112,6 +123,8 @@ class App:
         self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.open_json_button.config(state='disabled'); self.open_folder_button.config(state='disabled'); self.report=None
         self.stage_progress=StageProgress(mtu,tune); self.refresh_progress()
         self.status.set('正在准备实验…')
+        self.logbox.config(state='normal'); self.logbox.delete('1.0','end'); self.logbox.config(state='disabled')
+        self.log('开始新实验；模式：'+('受控' if usage_mode=='controlled' else '共享')+f'；计划 {rounds} 轮。')
         for item in self.table.get_children():self.table.delete(item)
         def task():
             warnings=[]; snap={}; current={}; observer=monitor.Monitor()
@@ -125,7 +138,8 @@ class App:
                 for ip,names in current.items():servers[ip]=servers.get(ip,'当前 DNS')
                 if not servers:raise core.ProbeError('没有候选 DNS。')
                 if len(servers)>20:raise core.ProbeError('候选超过 20 个，停止以限制请求。')
-                stage('dns','正在测试所选 DNS 解析…')
+                emit(f'配置读取结束：网卡记录 {len(snap.get("interfaces",[]))} 条；路由 {len(snap.get("routes",[]))} 条；DNS 候选 {len(servers)} 个。')
+                stage('dns',f'正在测试 DNS：{len(servers)} 个服务器 × {len(domains)} 个域名 × {rounds} 轮。')
                 rows=core.dns_benchmark(servers,domains,rounds,self.stop,emit)
                 stage('dns_validation','验证实验有效性并重新读取网络配置…')
                 after={}
@@ -134,9 +148,11 @@ class App:
                 gate=monitor.apply_dns_gate(validity.assess(rows,snap,after,current),observer.evidence('dns'))
                 summary,choice,note=core.summarize_dns(rows,servers,domains,rounds,current,gate)
                 warnings.extend(gate['messages'])
+                emit('DNS 有效性检查结束：'+('允许推荐' if gate.get('recommendation_allowed') else '不允许推荐')+'；'+note)
                 warnings.append('VPN/代理、DoH、IPv6 DNS、分流及 CDN 可能使真实体验不同；不应仅凭 DNS 延迟变更系统。')
                 stage('performance','采集实际网络传输性能…')
                 perf=performance.collect(self.stop,emit,rounds,sample,icmp,https)
+                emit(f'实际性能采集结束：TCP {len(perf["tcp"])} 个目标；ICMP {len(perf["icmp"])} 个目标；HTTPS {len(perf["https_samples"])} 条样本。')
                 tcp=perf['tcp']
                 mt=None
                 if mtu:
@@ -156,9 +172,16 @@ class App:
                     stage('history','正在认证环境与历史证据…')
                     try:observer.checkpoint('after_tuning','done')
                     except (core.ProbeError,OSError,ValueError):warnings.append('无法取得并发寻优结束时网络快照。')
+                    emit('正在检查全局配置、预探测及每个候选的环境和负载覆盖。')
                     tuning_result=tuning.apply_environment_gate(tuning_result,observer.evidence('tuning'))
+                    for row in tuning_result.get('candidate_local_evidence',[]):
+                        emit(f'{row["concurrency"]} 路局部认证：'+('通过' if row['local_evidence_certified'] else '未通过')+f'；有效配对 {row["valid_pairs"]}/{row["attempted_pairs"]}；原因 '+('、'.join(row.get('reasons',[])) or '无'))
+                    emit('正在写入历史证据库，检查预探测分层、独立运行及 24 小时窗口。')
                     history=evidence.persist_and_analyze(tuning_result,observer.records)
+                    emit('历史证据库：'+tuning.history_store_label(history.get('history_store',{}))+'；'+tuning.history_state_label(history.get('history_store',{})))
                     tuning_result=tuning.apply_history_evidence(tuning_result,history)
+                    for row in tuning_result.get('historical_evidence',[]):
+                        emit(f'{row["concurrency"]} 路历史认证：{tuning.evidence_label(row)}；独立运行 {row["history_valid_run_count"]}；过期运行 {row.get("history_expired_run_count",0)}。')
                     tuning_result['monitoring_overhead']=observer.overhead(tuning_result.get('pilots',[])+tuning_result.get('batches',[]))
                     tuning_result['load_monitor']=observer.load_evidence()
                 stage('diagnostics','整理环境记录、IPv6 及防火墙配置旁证…')
@@ -173,7 +196,7 @@ class App:
                 data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':core.VERSION,'snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 stage('export','正在生成 HTML、JSON 和 CSV 报告…')
                 directory=core.new_report_directory()
-                report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
+                report=core.save_report(directory,data,emit=emit); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('cancelled','已取消；未完成的实验不生成推荐。'))
             except Exception as e:self.queue.put(('error',str(e) if isinstance(e,core.ProbeError) else '测量失败：'+type(e).__name__))
             finally:
@@ -192,6 +215,7 @@ class App:
                 if kind=='stage':
                     self.stage_progress.enter(data); self.refresh_progress()
                 elif kind=='progress':
+                    self.log(data)
                     if not self.stop.is_set():self.status.set(data)
                 elif kind in ('error','cancelled'):
                     self.stage_progress.abort(cancelled=kind=='cancelled'); self.refresh_progress()

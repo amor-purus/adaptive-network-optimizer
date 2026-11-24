@@ -54,3 +54,20 @@ class StageProgressTests(unittest.TestCase):
         self.assertEqual(fresh.completed, 0)
         self.assertEqual(fresh.state, "running")
         self.assertEqual(p.state, "complete")
+
+
+class DetailTests(unittest.TestCase):
+    def test_missing_metric_not_zero(self):
+        from progress import metric
+        for value in (None, float("nan"), float("inf"), "1", True):
+            self.assertEqual(metric(value, " ms"), "未测得")
+        self.assertEqual(metric(0, " ms"), "0.00 ms")
+
+    def test_batch_reports_actual_bytes_and_failure(self):
+        from progress import batch_detail
+        text = batch_detail(dict(success=1, planned=2, actual_bytes=10,
+                                 expected_bytes=20, status="Failed"))
+        self.assertIn("1/2", text)
+        self.assertIn("10/20 字节", text)
+        self.assertIn("未完整成功", text)
+        self.assertIn("未测得", text)

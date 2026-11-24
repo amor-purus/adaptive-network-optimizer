@@ -10,6 +10,7 @@ import secrets
 import statistics
 import time
 import uuid
+from progress import batch_detail, metric
 import core
 import performance
 
@@ -412,6 +413,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         return True
     def wait_load(stage,timeout):
         if not result['load_scheduler_enabled']:return dict(stage=stage,status='NOT_ENABLED',waited_seconds=0,action='PROCEED_TEST_HARNESS')
+        emit(f'正在等待低负载窗口：{stage}；本次等待上限 {timeout:.1f} 秒，需连续 3 个新采样区间。')
         if load_monitor is None:entry=dict(status='LOAD_MONITOR_UNAVAILABLE',waited_seconds=0)
         else:
             try:entry=load_monitor.wait_for_idle(stop,timeout)
@@ -420,6 +422,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         entry=dict(entry,stage=stage,timeout_seconds=timeout)
         entry['action']='PROCEED_IDLE' if entry.get('status')=='IDLE_WINDOW' else 'PROCEED_SHARED_OBSERVATION' if usage_mode=='shared' else 'SKIP'
         result['load_schedule'].append(entry)
+        emit(f'负载窗口 {stage}：{entry.get("status")}；等待 {metric(entry.get("waited_seconds"), " 秒")}；动作 {entry["action"]}。')
         return entry
     def schedule_pilot(index):
         if not result['load_scheduler_enabled']:return wait_load('pilot_%d'%(index+1),0),True
@@ -466,6 +469,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             result.update(stop_reason='PILOT_BUDGET',decision='INCOMPLETE_EXPERIMENT',decision_note='预探测预算不足。');return result
         emit('独立预探测 %d/%d：128 KiB；不进入正式比较。'%(pindex+1,PILOT_COUNT))
         pilot=measure(1,0,PILOT_BYTES,5)
+        emit(f'预探测 {pindex+1}/{PILOT_COUNT} 结束：'+batch_detail(pilot))
         pilot['pilot_index']=pindex+1
         pilot['load_window']=load_window
         pilot['load_window_verified']=(not result['load_scheduler_enabled']) or (load_window.get('status')=='IDLE_WINDOW' and (pilot.get('pre_batch_load_state') is None or pilot['pre_batch_load_state'].get('idle') is True))
@@ -482,6 +486,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     if not challengers:
         result.update(decision='NO_COMPARABLE_CANDIDATE',decision_note='样本预算不足以比较候选。');return result
     emit('正式实验锁定：%d KiB/批，连接超时 %d 秒，候选 %s'%(plan['total_bytes']//1024,plan['connect_timeout_seconds'],plan['candidates']))
+    emit(f'校准完成：预探测中位 {metric(plan.get("pilot_speed_mbps"), " Mbps",3)}；候选 {plan["candidates"]}；排除 {plan["excluded_candidates"]}。')
     initial_order={c:bool(rng.randrange(2)) for c in challengers}
     def pair(c,r,retest=False):
         core.check_cancel(stop)
@@ -494,6 +499,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         order=[1,c] if first else [c,1]
         result['randomized_order'].append(dict(pair_id=ident,order=order))
         measured={}
+        emit(f'准备配对 {ident}：第 {r} 轮，{c} 路对比 1 路；顺序 {order}；每批 {size//1024} KiB。')
         begin,load_window=schedule_pair_boundary(ident,reserve_seconds)
         if begin is None and result['load_scheduler_enabled']:
             result['load_window_unavailable']=True
@@ -503,13 +509,15 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         for n in order:
             core.check_cancel(stop)
             if not reserve(size,MAX_BATCH_SECONDS+boundary_cost()):return False
-            emit(('配对补测' if retest else '相邻配对')+' %s：%d 路'%(ident,n))
+            emit(f'正在{"补测" if retest else "测量"} {ident}：第 {order.index(n)+1}/2 批，{n} 路并发，{"基线" if n==1 else "候选"}；{size//1024} KiB。')
             b=measure(n,r,size,plan['connect_timeout_seconds'],retest)
+            emit(f'{ident} {n} 路批次结束：'+batch_detail(b))
             b.update(pair_id=ident,baseline_for=c,sequence=len(result['batches'])+1,max_time_seconds=plan['max_time_seconds'])
             result['batches'].append(b);measured[n]=b
             result['reserved_bytes']+=size;result['received_body_bytes']+=b['actual_bytes']
             if b['http_blocked']:
                 result['blocked']=True;return False
+        emit(f'正在核验 {ident}：环境快照、负载窗口、协议与等工作量。')
         end=mark('pair_'+ident+'_end')
         p=evaluate_pair(measured[1],measured[c],plan)
         evidence=window(begin,end,measured[order[0]]['started_elapsed_s'],measured[order[-1]]['finished_elapsed_s'])
@@ -528,6 +536,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             p['valid']=False
             p['reasons']=sorted(set(p['reasons']+['PAIR_ENVIRONMENT_NOT_VERIFIED']))
         result['pairs'].append(p)
+        emit(f'{ident} 配对：'+('有效' if p['valid'] else '无效，'+('、'.join(p['reasons']) or '原因未提供'))+'；速度比 '+metric(p.get('speedup'),' 倍',3)+'。')
         return True
     complete=True
     eliminated=set()
@@ -538,6 +547,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             row=summarize_pairs(result['pairs'],[1,c],rounds)[0]
             state=evidence_state(row,rounds)
             if state in ('IRRECOVERABLE_SPREAD','IRRECOVERABLE_COMPARABILITY'):
+                emit(f'{c} 路停止后续正式配对：{state}；保留已采集的全部证据。')
                 eliminated.add(c)
                 result['eliminated_candidates'].append(dict(concurrency=c,after_round=r,reason=state,
                     skipped_formal_pairs=rounds-r,variation_ratio=row['variation_ratio']))
@@ -557,6 +567,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             if not pending:break
             chosen=min(pending,key=lambda s:(s['attempted_rounds'],s['concurrency']))
             c=chosen['concurrency'];r=chosen['attempted_rounds']+1
+            emit(f'证据不足：安排 {c} 路第 {r} 轮补测；追加配对 {result["extra_pairs"]+1}/{MAX_EXTRA_PAIRS}。')
             result['retest_candidate']=c
             before=len(result['batches'])
             done=pair(c,r,True)
@@ -594,6 +605,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     elif 'PAIR_LIMIT_REACHED' in states:reason='CANDIDATE_PAIR_LIMIT'
     else:reason='NO_RECOVERABLE_CANDIDATE'
     result['stop_reason']=reason
+    emit(f'并发配对结束：{reason}；尝试 {len(result["pairs"])} 组；有效 {sum(bool(p["valid"]) for p in result["pairs"])} 组。')
     qualified=[s for s in summary if s['evidence_state'] in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN')]
     result['qualified_subset_candidates']=[1]+[s['concurrency'] for s in qualified] if qualified else []
     if qualified and complete and not result['blocked']:

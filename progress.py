@@ -65,3 +65,19 @@ class StageProgress:
         if self.state != "running":
             return prefix + (" · 已取消" if self.state == "cancelled" else " · 失败")
         return prefix + (" · 正在" + self.active if self.active else " · 准备开始")
+
+
+def metric(value, unit="", digits=2):
+    """Display-only formatter; missing data never becomes a zero measurement."""
+    import math
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return "未测得"
+    return f"{value:.{digits}f}{unit}"
+
+
+def batch_detail(row):
+    return (f"请求成功 {row.get('success', 0)}/{row.get('planned', 0)}；"
+            f"正文 {row.get('actual_bytes', 0)}/{row.get('expected_bytes', 0)} 字节；"
+            f"有效速率 {metric(row.get('aggregate_mbps'), ' Mbps', 3)}；"
+            f"耗时 {metric(row.get('elapsed_s'), ' 秒')}；"
+            + ("批次完成" if row.get("status") == "OK" else "批次未完整成功"))

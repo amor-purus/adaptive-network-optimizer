@@ -155,12 +155,13 @@ def dns_benchmark(servers,domains,rounds,stop,emit=lambda _:None,probe=dns_probe
     for r in range(rounds):
         for j,domain in enumerate(domains):
             for k in range(len(ips)):
-                check_cancel(stop); ip=ips[(k+j+r)%len(ips)]; emit(f'DNS {r+1}/{rounds}：{servers[ip]} / {domain}')
+                check_cancel(stop); ip=ips[(k+j+r)%len(ips)]; emit(f'正在查询 DNS {len(rows)+1}/{rounds*len(domains)*len(ips)}（第 {r+1}/{rounds} 轮）：{servers[ip]} {ip} / {domain}')
                 row={'round':r+1,'domain':domain,'server':ip,'status':'Failed','ms':None,'transport':'','answers':[],'error':''}
                 try:
                     ms,answers,transport=probe(ip,domain); row.update(status='OK',ms=ms,answers=answers,transport=transport)
                 except (OSError,ProbeError) as e: row['error']='超时或网络错误' if isinstance(e,OSError) else str(e)
                 rows.append(row)
+                emit(f'DNS 查询结束：{servers[ip]} / {domain}；'+(f'{row["ms"]} ms，{len(row["answers"])} 条应答' if row['status']=='OK' else row['error']))
                 if stop.wait(.04): raise Cancelled()
     return rows
 
@@ -184,12 +185,13 @@ def ping_df(ip,payload):
 def mtu_probe(ip,stop,emit=lambda _:None,ping=ping_df):
     trials=[]
     def test(n):
-        check_cancel(stop); emit(f'MTU：测试 {n+28} 字节 IPv4 包')
+        check_cancel(stop); emit(f'正在探测 MTU：{ip}，IPv4 包 {n+28} 字节，计划 3 次')
         hits=0
         for _ in range(3):
             check_cancel(stop)
             hits+=int(ping(ip,n))
         trials.append({'packet_bytes':n+28,'success':hits,'attempted':3})
+        emit(f'MTU {n+28} 字节：成功 {hits}/3 次。')
         return hits==3
     if not test(32): return {'target':ip,'observed_mtu':None,'trials':trials,'note':'小包不稳定或 ICMP 被阻止，无法估计。'}
     if test(1472): return {'target':ip,'observed_mtu':1500,'trials':trials,'note':'1500 字节通过；未探测巨帧。'}
@@ -224,12 +226,15 @@ def new_report_directory(desktop=None,now=None,run_id=None):
     return root/'AdaptiveNetworkOptimizer'/(stamp+'-'+str(token))
 
 
-def save_report(directory,data):
+def save_report(directory,data,emit=lambda _:None):
     root=Path(directory); root.mkdir(parents=True,exist_ok=False)
     json_path=root/'report.json'; temp_path=root/'report.json.tmp'
+    emit('正在写入 report.json 临时文件并原子替换…')
     temp_path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
     os.replace(temp_path,json_path)
+    emit('report.json 已写入。')
     for name,rows in [('dns_samples.csv',data['dns_samples']),('dns_summary.csv',data['dns_summary'])]:
+        emit('正在写入 '+name+'…')
         with (root/name).open('w',encoding='utf-8-sig',newline='') as f:
             if rows:
                 w=csv.DictWriter(f,fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
@@ -237,14 +242,17 @@ def save_report(directory,data):
     perf_html=''
     if 'performance' in data:
         import performance
+        emit('正在写入网络性能 CSV 并整理 HTML 内容…')
         performance.write_csvs(root,data['performance'])
         perf_html=performance.report_html(data['performance'],data.get('performance_baseline',{}))
     if 'environment_monitor' in data:
         import monitor
+        emit('正在写入环境监测 CSV 并整理 HTML 内容…')
         monitor.write_csvs(root,data['environment_monitor'])
         perf_html+=monitor.report_html(data['environment_monitor'])
     if 'tuning_experiment' in data:
         import tuning
+        emit('正在写入并发寻优及历史证据 CSV 并整理 HTML 内容…')
         tuning.write_csvs(root,data['tuning_experiment'])
         perf_html+=tuning.report_html(data['tuning_experiment'])
     esc=lambda x:html.escape(str(x)); s=data['dns_summary']; choice=data['recommendation']
@@ -255,5 +263,7 @@ def save_report(directory,data):
     valid=[r for r in s if gate and r['eligible']]; top=max((r['median_ms'] for r in valid),default=1) or 1
     bars=''.join('<p>'+esc(r['name'])+' '+esc(r['server'])+' — '+str(r['median_ms'])+' ms</p><div style="height:12px;background:#285eb3;width:%.2f%%"></div>'%(100*r['median_ms']/top) for r in valid)
     details=esc(json.dumps({'tcp':data['tcp'],'mtu':data['mtu'],'warnings':data['warnings'],'validity':data.get('validity',{})},ensure_ascii=False,indent=2))
+    emit('正在写入 report.html…')
     (root/'report.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>网络优化报告</title><style>body{font-family:"Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;font-size:16px;line-height:1.75;color:#202938;max-width:1100px;margin:32px auto;padding:0 20px}h1,h2,h3{line-height:1.4}table{border-collapse:collapse;width:100%;margin:14px 0}td,th{border:1px solid #cbd5e1;padding:10px 12px;text-align:left;font-size:15px}th{font-weight:700;background:#f1f5f9}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.65 "Cascadia Mono","Consolas",monospace;background:#f8fafc;padding:14px;border-radius:8px}</style><h1>自适应网络优化报告</h1><p>推荐 DNS 候选：'+esc(choice['server'] if choice else '无')+'</p><p>'+esc(data['note'])+'</p><h2>实验有效性</h2><p>'+esc(validity.get('environment','environment_unverified'))+'：'+validity_text+'</p><p>下表为原始观测；仅通过有效性检查且完整成功的候选绘图。TCP/MTU 仅代表当前实际路径。</p>'+bars+table+'<h2>连接及 MTU 诊断</h2><pre>'+details+'</pre>'+perf_html+'<p>系统配置未修改。JSON 包含本地网卡、路由和 DNS 信息，分享前请检查。</p></html>',encoding='utf-8')
+    emit('报告文件全部写入完成。')
     return root
