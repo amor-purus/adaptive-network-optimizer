@@ -58,6 +58,33 @@ class MonitorTests(unittest.TestCase):
         e2=m.phase_evidence(changed,'tuning')
         self.assertFalse(e2['telemetry_observed_stable']);self.assertGreater(len(e2['telemetry_changes']),0)
 
+    def test_tuning_tolerates_small_signal_and_link_rate_fluctuations(self):
+        def full(label,seconds,rate,signal):
+            snap=copy.deepcopy(BASE)
+            snap.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',
+                LinkSpeed=str(rate)+' Mbps',ReceiveLinkSpeed=int(rate*1000000),
+                TransmitLinkSpeed=int(rate*1000000),MediaConnectionState=1)])
+            return dict(label=label,phase='tuning',elapsed_s=seconds,observed_at='test',snapshot=snap,
+                wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=signal,rx_mbps=rate,tx_mbps=rate)]))
+        rs=[full('after_performance',0,780,99),full('periodic',45,702,98),full('after_tuning',90,866.7,99)]
+        e=m.phase_evidence(rs,'tuning')
+        self.assertTrue(e['telemetry_complete'])
+        self.assertTrue(e['telemetry_observed_stable'])
+        self.assertGreater(len(e['telemetry_tolerated_changes']),0)
+        self.assertEqual(e['telemetry_significant_changes'],[])
+
+    def test_tuning_still_rejects_adapter_state_change(self):
+        def full(label,state):
+            snap=copy.deepcopy(BASE)
+            snap.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status=state,
+                LinkSpeed='866.7 Mbps',ReceiveLinkSpeed=866700000,TransmitLinkSpeed=866700000,
+                MediaConnectionState=1 if state=='Up' else 2)])
+            return dict(label=label,phase='tuning',elapsed_s=0,observed_at='test',snapshot=snap,
+                wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=866.7)]))
+        e=m.phase_evidence([full('after_performance','Up'),full('after_tuning','Down')],'tuning')
+        self.assertFalse(e['telemetry_observed_stable'])
+        self.assertGreater(len(e['telemetry_significant_changes']),0)
+
     def test_tuning_rejects_unavailable_wireless_telemetry(self):
         a=dict(label='after_performance',elapsed_s=0,snapshot=dict(BASE,adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up')]),wlan=dict(status='Unavailable',interfaces=[]))
         b=dict(label='after_tuning',elapsed_s=1,snapshot=dict(BASE,adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up')]),wlan=dict(status='Unavailable',interfaces=[]))

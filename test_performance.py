@@ -19,6 +19,23 @@ class PerformanceTests(unittest.TestCase):
         self.assertIsNone(r['body_mbps'])
         self.assertEqual(r['body_rate_status'],'INSUFFICIENT_WINDOW')
 
+    def test_connect_timeout_not_misclassified_by_starttransfer_timer(self):
+        raw='000|0||0.029222|0|0|5.004689|5.004697|0'
+        r=p.parse_curl(raw,28,0,512*1024,512*1024)
+        self.assertEqual(r['error_category'],'TCP_CONNECT_TIMEOUT')
+        self.assertEqual(r['failure_phase'],'tcp_connect')
+        self.assertIsNone(r['ttfb_ms'])
+        self.assertAlmostEqual(r['dns_ms'],29.222)
+        self.assertIsNone(r['tcp_ms'])
+
+    def test_timeout_phase_requires_completed_predecessor(self):
+        tls=p.parse_curl('000|0|1.1.1.1|0.01|0.02|0|0|5|0',28,0,1024,1024)
+        first=p.parse_curl('000|0|1.1.1.1|0.01|0.02|0.04|0|5|0',28,0,1024,1024)
+        body=p.parse_curl('200|2|1.1.1.1|0.01|0.02|0.04|1|5|100',28,100,1024,1024)
+        self.assertEqual((tls['error_category'],tls['failure_phase']),('TLS_HANDSHAKE_TIMEOUT','tls_handshake'))
+        self.assertEqual((first['error_category'],first['failure_phase']),('FIRST_BYTE_TIMEOUT','server_response'))
+        self.assertEqual((body['error_category'],body['failure_phase']),('BODY_TRANSFER_TIMEOUT','body_transfer'))
+
     def test_bad_telemetry(self):
         for s in ('',GOOD.replace('0.02','nan'),GOOD.replace('0.04','0.001')):
             self.assertEqual(p.parse_curl(s,0,1000000,1000000,1000000)['status'],'Failed')

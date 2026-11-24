@@ -27,7 +27,7 @@ class AdaptiveTests(unittest.TestCase):
         rows[-1].update(effective_mbps=1,expected_bytes=200);self.assertIn('MIXED_SAMPLE_SIZE',a.quality(rows)['reasons'])
     def test_partial_timeout(self):
         r=p.parse_curl('200|1.1|198.18.0.76|0.01|0.02|0.5|1|20|200308',28,200308,1048576,1048576)
-        self.assertEqual(r['error_category'],'TRANSFER_TIMEOUT');self.assertEqual(r['ttfb_ms'],1000);self.assertEqual(r['total_ms'],20000);self.assertIsNone(r['effective_mbps']);self.assertEqual(r['bytes'],200308)
+        self.assertEqual(r['error_category'],'BODY_TRANSFER_TIMEOUT');self.assertEqual(r['ttfb_ms'],1000);self.assertEqual(r['total_ms'],20000);self.assertIsNone(r['effective_mbps']);self.assertEqual(r['bytes'],200308)
     def test_tls_error(self):
         r=p.parse_curl('000|0||0.01|0.02|0|0|5|0',35,0,0,1024)
         self.assertEqual(r['error_category'],'TLS_ERROR');self.assertIsNone(r['tls_ms']);self.assertEqual(r['tcp_ms'],10)

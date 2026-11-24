@@ -35,8 +35,21 @@ def stats(values):
     return {'success':len(good),'attempted':len(values),'median':round(statistics.median(good),3) if good else None,'p95':round(core.percentile(good,.95),3) if good else None,'jitter_ms':jitter(values)}
 
 
+def timeout_failure_phase(dns, tcp, tls, first):
+    """Classify curl timeout from completed cumulative phases, not isolated later timers."""
+    if tcp > 0 and tls > 0 and first > 0:
+        return 'BODY_TRANSFER_TIMEOUT', 'body_transfer'
+    if tcp > 0 and tls > 0:
+        return 'FIRST_BYTE_TIMEOUT', 'server_response'
+    if tcp > 0:
+        return 'TLS_HANDSHAKE_TIMEOUT', 'tls_handshake'
+    if dns > 0:
+        return 'TCP_CONNECT_TIMEOUT', 'tcp_connect'
+    return 'DNS_OR_CONNECT_TIMEOUT', 'dns_or_connect'
+
+
 def parse_curl(output, code, actual, expected, cap):
-    row=dict(status='Failed',exit_code=code,http_status=None,http_version='',remote_ip='',bytes=actual,dns_ms=None,tcp_ms=None,tls_ms=None,ttfb_ms=None,total_ms=None,body_mbps=None,body_rate_status='NOT_MEASURED',effective_mbps=None,error='',error_category='',raw_timings_s=None)
+    row=dict(status='Failed',exit_code=code,http_status=None,http_version='',remote_ip='',bytes=actual,dns_ms=None,tcp_ms=None,tls_ms=None,ttfb_ms=None,total_ms=None,body_mbps=None,body_rate_status='NOT_MEASURED',effective_mbps=None,error='',error_category='',failure_phase=None,raw_timings_s=None)
     fields=output.strip().split('|')
     if len(fields)!=len(FIELDS):
         row.update(error='curl 遥测缺失',error_category='TELEMETRY_MISSING'); return row
@@ -54,20 +67,21 @@ def parse_curl(output, code, actual, expected, cap):
     if 0<tcp<=total and dns<=tcp:row['tcp_ms']=round((tcp-dns)*1000,3)
     if 0<tls<=total and 0<tcp<=tls:row['tls_ms']=round((tls-tcp)*1000,3)
     if 0<first<=total and 0<tls<=first:row['ttfb_ms']=round(first*1000,3)
-    if status in (403,429):category='HTTP_BLOCKED'
-    elif code==28:category='TRANSFER_TIMEOUT' if first>0 else 'FIRST_BYTE_TIMEOUT' if tls>0 else 'TLS_OR_CONNECT_TIMEOUT' if tcp>0 else 'CONNECT_OR_RESOLVE_TIMEOUT'
-    elif code in (35,51,58,59,60,77,83,90,91):category='TLS_ERROR'
-    elif code in (5,6):category='RESOLUTION_ERROR'
-    elif code==7:category='CONNECT_ERROR'
-    elif code==63 or actual>cap:category='SIZE_LIMIT'
-    elif code in (18,23,55,56):category='TRANSFER_ERROR'
-    elif code:category='CURL_ERROR'
-    elif not 200<=status<300:category='HTTP_STATUS'
-    elif size!=actual or (expected is not None and actual!=expected):category='BYTE_MISMATCH'
-    elif not (0<=dns<=tcp<=tls<=first<=total and tcp>0 and tls>0 and total>0):category='TIMING_INVALID'
+    phase=None
+    if status in (403,429):category='HTTP_BLOCKED';phase='http_response'
+    elif code==28:category,phase=timeout_failure_phase(dns,tcp,tls,first)
+    elif code in (35,51,58,59,60,77,83,90,91):category='TLS_ERROR';phase='tls_handshake'
+    elif code in (5,6):category='RESOLUTION_ERROR';phase='dns_resolution'
+    elif code==7:category='CONNECT_ERROR';phase='tcp_connect'
+    elif code==63 or actual>cap:category='SIZE_LIMIT';phase='body_transfer'
+    elif code in (18,23,55,56):category='TRANSFER_ERROR';phase='body_transfer' if tcp>0 and tls>0 and first>0 else 'transfer_or_connection'
+    elif code:category='CURL_ERROR';phase='unknown'
+    elif not 200<=status<300:category='HTTP_STATUS';phase='http_response'
+    elif size!=actual or (expected is not None and actual!=expected):category='BYTE_MISMATCH';phase='body_validation'
+    elif not (0<=dns<=tcp<=tls<=first<=total and tcp>0 and tls>0 and total>0):category='TIMING_INVALID';phase='timing_validation'
     else:category=''
     if category:
-        row.update(error=category,error_category=category);return row
+        row.update(error=category,error_category=category,failure_phase=phase);return row
     row.update(status='OK',dns_ms=round(dns*1000,3),tcp_ms=round((tcp-dns)*1000,3),tls_ms=round((tls-tcp)*1000,3),ttfb_ms=round(first*1000,3),total_ms=round(total*1000,3))
     if expected and actual:
         row['effective_mbps']=round(actual*8/total/1e6,3)
@@ -79,17 +93,19 @@ def parse_curl(output, code, actual, expected, cap):
     return row
 
 
-def https_probe(exe,url,expected,cap,stop):
+def https_probe(exe,url,expected,cap,stop,connect_timeout=5,max_time=20):
     core.check_cancel(stop)
+    if not (5 <= float(connect_timeout) <= 10 and 5 <= float(max_time) <= 30):
+        raise ValueError('HTTPS 超时参数超出安全边界。')
     with tempfile.TemporaryDirectory(prefix='ano-https-') as tmp:
         body=Path(tmp)/'body'; meta=Path(tmp)/'meta'
         # Use existing environment proxy rules; no proxy override, redirects, retries or TLS bypass.
-        args=[exe,'--disable','--silent','--show-error','--proto','=https','--connect-timeout','5','--max-time','20','--max-filesize',str(cap),'--header','Accept-Encoding: identity','--header','Cache-Control: no-cache','--output',str(body),'--write-out',FORMAT,'--',url]
+        args=[exe,'--disable','--silent','--show-error','--proto','=https','--connect-timeout',str(connect_timeout),'--max-time',str(max_time),'--max-filesize',str(cap),'--header','Accept-Encoding: identity','--header','Cache-Control: no-cache','--output',str(body),'--write-out',FORMAT,'--',url]
         killed=False
         with meta.open('wb') as out:
             p=subprocess.Popen(args,stdout=out,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             try:
-                deadline=time.monotonic()+25
+                deadline=time.monotonic()+float(max_time)+5
                 while p.poll() is None:
                     if stop.wait(.025):raise core.Cancelled()
                     if time.monotonic()>deadline or (body.exists() and body.stat().st_size>cap):

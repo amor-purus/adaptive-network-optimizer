@@ -146,6 +146,59 @@ def telemetry_diff(before,after):
     return changes
 
 
+def _rate_value(value,field):
+    if value is None:return None
+    try:
+        if field in ('rx_mbps','tx_mbps'):
+            number=float(value)
+            return number*1_000_000 if number>=0 else None
+        if field in ('ReceiveLinkSpeed','TransmitLinkSpeed'):
+            number=float(value)
+            return number if number>=0 else None
+        text=str(value).strip().lower().replace(',','')
+        match=re.fullmatch(r'(\d+(?:\.\d+)?)\s*(bps|kbps|mbps|gbps)',text)
+        if not match:return None
+        factor={'bps':1,'kbps':1_000,'mbps':1_000_000,'gbps':1_000_000_000}[match.group(2)]
+        return float(match.group(1))*factor
+    except (TypeError,ValueError,OverflowError):
+        return None
+
+
+def classify_telemetry_change(change):
+    """Treat small radio/link-rate movement as noise; adapter state changes remain hard failures."""
+    field=change.get('field')
+    if field in ('Status','MediaConnectionState'):
+        return dict(severity='significant',reason='ADAPTER_STATE_CHANGED')
+    if field=='signal_percent':
+        try:
+            delta=abs(float(change.get('after'))-float(change.get('before')))
+        except (TypeError,ValueError,OverflowError):
+            return dict(severity='significant',reason='SIGNAL_TELEMETRY_INCOMPLETE')
+        if delta<=5:
+            return dict(severity='tolerated',reason='WITHIN_SIGNAL_TOLERANCE')
+        return dict(severity='significant',reason='SIGNAL_CHANGE_EXCEEDS_5_POINTS',delta=round(delta,3))
+    if field in ('LinkSpeed','ReceiveLinkSpeed','TransmitLinkSpeed','rx_mbps','tx_mbps'):
+        before=_rate_value(change.get('before'),field)
+        after=_rate_value(change.get('after'),field)
+        if before is None or after is None or before<=0 or after<=0:
+            return dict(severity='significant',reason='LINK_RATE_TELEMETRY_INCOMPLETE')
+        delta=abs(after-before)/max(abs(before),abs(after))
+        if delta<=.25:
+            return dict(severity='tolerated',reason='WITHIN_LINK_RATE_TOLERANCE',relative_change=round(delta,4))
+        return dict(severity='significant',reason='LINK_RATE_CHANGE_EXCEEDS_25_PERCENT',relative_change=round(delta,4))
+    return dict(severity='significant',reason='UNCLASSIFIED_TELEMETRY_CHANGE')
+
+
+def telemetry_stability(changes):
+    classified=[dict(c,**classify_telemetry_change(c)) for c in changes]
+    tolerated=[c for c in classified if c['severity']=='tolerated']
+    significant=[c for c in classified if c['severity']!='tolerated']
+    return dict(stable=not significant,tolerated_changes=tolerated,
+                significant_changes=significant,classified_changes=classified,
+                policy=dict(signal_tolerance_percentage_points=5,link_rate_relative_tolerance=.25,
+                            adapter_status_and_media_state='no_change_allowed'))
+
+
 def phase_evidence(records,phase):
     bounds={'dns':('start','after_dns'),'performance':('after_dns','after_performance'),
             'tuning':('after_performance','after_tuning')}
@@ -162,10 +215,15 @@ def phase_evidence(records,phase):
             telemetry_changes.append(dict(c,from_elapsed_s=x['elapsed_s'],to_elapsed_s=y['elapsed_s'],observed_at=y['observed_at']))
     ok=bool(rs) and all(complete(r['snapshot']) for r in rs)
     telemetry_ok=bool(rs) and all(telemetry_available(r) for r in rs)
+    assessment=telemetry_stability(telemetry_changes)
     return dict(phase=phase,samples=len(rs),complete=ok,observed_stable=bool(ok and not changes),changes=changes,
-                telemetry_complete=telemetry_ok,telemetry_observed_stable=bool(telemetry_ok and not telemetry_changes),
-                telemetry_changes=telemetry_changes,
-                scope='仅为离散采样观察；变化发生在两次采样之间，未检测到变化不证明持续不变。无法确认人为或自动修改者。')
+                telemetry_complete=telemetry_ok,
+                telemetry_observed_stable=bool(telemetry_ok and assessment['stable']),
+                telemetry_changes=assessment['classified_changes'],
+                telemetry_tolerated_changes=assessment['tolerated_changes'],
+                telemetry_significant_changes=assessment['significant_changes'],
+                telemetry_tolerance_policy=assessment['policy'],
+                scope='配置变化仍严格拦截；无线信号变化不超过 5 个百分点、链路速率变化不超过 25% 时按遥测噪声容差处理。适配器连接状态变化仍严格拦截。仅为离散采样观察，不能证明采样间隙持续不变。')
 
 
 def apply_dns_gate(gate,evidence):
@@ -213,7 +271,7 @@ def write_csvs(root,env):
     fields=['phase','section','identity','field','before','after','kind','actor','from_elapsed_s','to_elapsed_s','observed_at','before_present','after_present']
     write('environment_changes.csv',changes,fields)
     telemetry=[dict(c,phase=p['phase']) for p in env['phases'] for c in p.get('telemetry_changes',[])]
-    write('network_telemetry_changes.csv',telemetry,['phase','section','identity','field','before','after','from_elapsed_s','to_elapsed_s','observed_at'])
+    write('network_telemetry_changes.csv',telemetry,['phase','section','identity','field','before','after','severity','reason','delta','relative_change','from_elapsed_s','to_elapsed_s','observed_at'])
     rows=[]
     for r in env['timeline']:
         for a in r['snapshot'].get('adapters',[]):
@@ -232,4 +290,6 @@ def report_html(env):
     telemetry=[dict(c,phase=p['phase']) for p in env['phases'] for c in p.get('telemetry_changes',[])]
     table='<table><tr><th>阶段</th><th>秒</th><th>对象</th><th>字段</th><th>之前</th><th>之后</th><th>判断</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(c.get(k))+'</td>' for k in ('phase','to_elapsed_s','identity','field','before','after','kind'))+'</tr>' for c in changes)+'</table>'
     telemetry_table='<table><tr><th>阶段</th><th>秒</th><th>对象</th><th>字段</th><th>之前</th><th>之后</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(c.get(k))+'</td>' for k in ('phase','to_elapsed_s','identity','field','before','after'))+'</tr>' for c in telemetry)+'</table>'
-    return '<h2>网络环境动态感知</h2><p>配置采样间隔：'+esc(INTERVAL)+' 秒；定期采样及阶段快照不会确认修改者，也不会证明采样间隙无变化。</p><p>采样数：'+esc(len(env['timeline']))+'；无线可测次数：'+esc(sum(r['wlan']['status']=='Measured' for r in env['timeline']))+'</p>'+table+'<h3>链路/无线遥测变化</h3>'+telemetry_table+'<h3>链路与无线时间线（不含 SSID/BSSID）</h3><pre>'+esc(json.dumps([dict(elapsed_s=r['elapsed_s'],label=r['label'],adapters=r['snapshot'].get('adapters',[]),wlan=r['wlan']) for r in env['timeline']],ensure_ascii=False,indent=2))+'</pre><h3>IPv6 与本地过滤旁证</h3><pre>'+esc(json.dumps(env['ipv6_diagnosis'],ensure_ascii=False,indent=2))+'</pre>'
+    tolerated=sum(1 for p in env['phases'] for c in p.get('telemetry_tolerated_changes',[]))
+    significant=sum(1 for p in env['phases'] for c in p.get('telemetry_significant_changes',[]))
+    return '<h2>网络环境动态感知</h2><p>配置采样间隔：'+esc(INTERVAL)+' 秒；定期采样及阶段快照不会确认修改者，也不会证明采样间隙无变化。</p><p>采样数：'+esc(len(env['timeline']))+'；无线可测次数：'+esc(sum(r['wlan']['status']=='Measured' for r in env['timeline']))+'</p>'+table+'<h3>链路/无线遥测变化</h3><p>容差内变化：'+esc(tolerated)+'；超出容差或无法判定：'+esc(significant)+'。信号强度容差 ±5 个百分点；链路速率相对变化容差 25%；适配器连接状态变化不容差。</p>'+telemetry_table+'<h3>链路与无线时间线（不含 SSID/BSSID）</h3><pre>'+esc(json.dumps([dict(elapsed_s=r['elapsed_s'],label=r['label'],adapters=r['snapshot'].get('adapters',[]),wlan=r['wlan']) for r in env['timeline']],ensure_ascii=False,indent=2))+'</pre><h3>IPv6 与本地过滤旁证</h3><pre>'+esc(json.dumps(env['ipv6_diagnosis'],ensure_ascii=False,indent=2))+'</pre>'

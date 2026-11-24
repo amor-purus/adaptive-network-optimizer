@@ -62,7 +62,7 @@ class TuningTests(unittest.TestCase):
         d=t.decide(t.summarize_batches(batches,(1,2,4,8),3),(1,2,4,8),True,False)
         self.assertTrue(d['comparison_ready'])
         self.assertEqual(d['selected_concurrency'],4)
-        self.assertEqual(d['decision'],'LOWEST_CONCURRENCY_NEAR_BEST')
+        self.assertEqual(d['decision'],'LOWEST_CONCURRENCY_NEAR_BEST_COMPOSITE_SCORE')
 
     def test_no_material_gain_keeps_one(self):
         batches=[]
@@ -79,6 +79,73 @@ class TuningTests(unittest.TestCase):
         self.assertFalse(d['comparison_ready'])
         self.assertIsNone(d['selected_concurrency'])
 
+    def test_adaptive_sample_size_and_bounded_growth(self):
+        first,plan=t.choose_worker_bytes(8,None)
+        self.assertEqual(first,t.BASE_WORKER_BYTES)
+        previous=dict(sample_bytes_per_worker=first,worker_rows=[
+            dict(status='OK',bytes=first,total_ms=1000,ttfb_ms=100,effective_mbps=1.0)])
+        next_size,next_plan=t.choose_worker_bytes(8,previous)
+        self.assertGreater(next_size,first)
+        self.assertLessEqual(next_size,first*2)
+        self.assertEqual(next_plan['mode'],'adaptive')
+        self.assertLessEqual(next_size,t.MAX_WORKER_BYTES)
+
+    def test_connect_timeout_adapts_within_bounds(self):
+        self.assertEqual(t.choose_connect_timeout(None),5)
+        previous=dict(worker_rows=[dict(dns_ms=1000,tcp_ms=1000,tls_ms=1000)])
+        self.assertEqual(t.choose_connect_timeout(previous),8)
+        slow=dict(worker_rows=[dict(dns_ms=10000,tcp_ms=10000,tls_ms=10000)])
+        self.assertEqual(t.choose_connect_timeout(slow),10)
+
+    def test_summary_includes_paired_speedup_and_success_rate(self):
+        batches=[]
+        for round_number in range(1,4):
+            batches.append(dict(concurrency=1,round=round_number,status='OK',aggregate_mbps=10,
+                success=1,planned=1,worker_rows=[dict(status='OK',ttfb_ms=100)]))
+            batches.append(dict(concurrency=2,round=round_number,status='OK',aggregate_mbps=12,
+                success=2,planned=2,worker_rows=[dict(status='OK',ttfb_ms=110)]*2))
+        summary=t.summarize_batches(batches,(1,2),3)
+        candidate={r['concurrency']:r for r in summary}[2]
+        self.assertEqual(candidate['paired_rounds'],3)
+        self.assertEqual(candidate['paired_median_speedup_pct'],20)
+        self.assertEqual(candidate['success_rate'],1.0)
+        self.assertTrue(candidate['eligible'])
+
+    def test_selects_one_retest_candidate(self):
+        summary=[dict(concurrency=1,eligible=True,median_mbps=10,success_rate=1,successful_rounds=3),
+                 dict(concurrency=2,eligible=False,median_mbps=13,success_rate=.75,successful_rounds=2),
+                 dict(concurrency=4,eligible=False,median_mbps=12,success_rate=.8,successful_rounds=2)]
+        self.assertEqual(t.select_retest_candidate(summary),2)
+        self.assertIsNone(t.select_retest_candidate([summary[0],
+            dict(concurrency=2,eligible=True,median_mbps=11,success_rate=1,successful_rounds=3)]))
+
+    def test_run_performs_one_paired_retest(self):
+        def fake_batch(exe,concurrency,round_number,stop,probe=None,total_bytes=t.AGGREGATE_BYTES,
+                       clock=None,connect_timeout=5,retest=False,sample_plan=None):
+            failed=concurrency==2 and round_number==1
+            workers=[]
+            for i in range(concurrency):
+                ok=not failed or i==0
+                workers.append(dict(status='OK' if ok else 'Failed',bytes=total_bytes//concurrency if ok else 0,
+                    total_ms=1000,ttfb_ms=100 if concurrency==1 else 110,effective_mbps=1.0,
+                    dns_ms=10,tcp_ms=10,tls_ms=10,error_category=None if ok else 'TCP_CONNECT_TIMEOUT'))
+            return dict(concurrency=concurrency,round=round_number,status='Failed' if failed else 'OK',
+                expected_bytes=total_bytes,actual_bytes=sum(w['bytes'] for w in workers),elapsed_s=1,
+                aggregate_mbps=None if failed else (10 if concurrency==1 else 12),
+                success=sum(w['status']=='OK' for w in workers),planned=concurrency,
+                sample_bytes_per_worker=total_bytes//concurrency,ttfb_median_ms=100 if concurrency==1 else 110,
+                error_categories=['TCP_CONNECT_TIMEOUT'] if failed else [],http_blocked=False,worker_rows=workers)
+        from unittest.mock import patch
+        with patch('tuning.run_batch',side_effect=fake_batch):
+            r=t.run(threading.Event(),exe='curl',rounds=2,candidates=(1,2),total_bytes=128*1024,
+                    phase_seconds=200,seed=4,clock=lambda:0)
+        self.assertEqual(r['retest_status'],'Completed')
+        self.assertEqual(r['retest_candidate'],2)
+        self.assertEqual(len(r['batches']),6)
+        self.assertEqual(sum(bool(b.get('retest')) for b in r['batches']),2)
+        self.assertTrue(r['recommendation_allowed'] is False)
+        self.assertEqual(r['selected_concurrency'],2)
+
     def test_environment_gate_requires_configuration_and_telemetry(self):
         result=dict(comparison_ready=True,selected_concurrency=4,decision='OK')
         bad=t.apply_environment_gate(result,dict(complete=True,observed_stable=True,telemetry_complete=False,telemetry_observed_stable=False))
@@ -94,8 +161,8 @@ class TuningTests(unittest.TestCase):
                 rounds=2,candidates=(1,2),total_bytes=128*1024,phase_seconds=100,seed=7,clock=lambda:0)
         self.assertEqual(r['status'],'Completed')
         self.assertEqual(len(r['batches']),4)
-        self.assertEqual(r['requested_budget_bytes'],4*128*1024)
-        self.assertEqual(r['reserved_bytes'],r['requested_budget_bytes'])
+        self.assertGreaterEqual(r['requested_budget_bytes'],r['reserved_bytes'])
+        self.assertEqual(r['reserved_bytes'],sum(b['expected_bytes'] for b in r['batches']))
         self.assertEqual(len(r['randomized_order']),2)
 
     def test_run_stops_after_rate_limit(self):
