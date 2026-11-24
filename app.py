@@ -185,6 +185,7 @@ class App:
                         verdict=tuning.evidence_label(row) if row['local_evidence_certified'] else '局部认证未通过'
                         self.log(f"{row['concurrency']} 路对比 1 路：{verdict}，有效配对 {row['valid_pairs']}/{row['attempted_pairs']}。")
                     self.log('历史证据库：'+tuning.history_store_label(tune.get('history_store',{})))
+                    self.log('历史性能状态：'+tuning.history_state_label(tune.get('history_store',{})))
                     for row in tune.get('historical_evidence',[]):
                         self.log(f"跨次验证 {row['concurrency']} 路：{tuning.evidence_label(row)}，{row['history_valid_run_count']} 次运行提供了 {row['paired_rounds']} 个有效配对。")
                     self.log('下载质量：'+str(result['performance'].get('download_experiment',{}).get('quality',{})))

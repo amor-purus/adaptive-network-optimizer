@@ -1,6 +1,7 @@
 """Persist paired HTTPS observations and validate independent measurement sessions."""
 from collections import defaultdict
 from contextlib import closing, contextmanager
+import datetime
 import hashlib
 import json
 import math
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import sqlite3
+import statistics
 import time
 import uuid
 
@@ -16,6 +18,8 @@ import tuning
 
 SCHEMA_VERSION = 2
 QUALITY_POLICY_ID = "adjacent-paired-quality-v2"
+HISTORY_POLICY_ID = "pilot-speed-band-age-v1"
+HISTORY_MAX_AGE_SECONDS = 24 * 60 * 60
 SUPPORTED = {"SUPPORTED_GAIN", "SUPPORTED_NO_GAIN"}
 
 
@@ -61,10 +65,56 @@ def network_fingerprint(snapshot):
     return _digest(config)
 
 
-def _context_id(result, fingerprint):
+def pilot_state(plan):
+    """Pre-outcome state, independent of candidate success or speedup.
+    Fixed power-of-two Mbps bands; uncertain pilot data cannot certify history.
+    """
+    state = dict(policy=HISTORY_POLICY_ID, status="UNVERIFIED", band=None,
+                 lower_mbps=None, upper_mbps=None, median_mbps=None,
+                 variation_ratio=None, cv=None, successful_pilots=0)
+    speeds = plan.get("pilot_speeds_mbps")
+    if not isinstance(speeds, list):
+        return state
+    state["successful_pilots"] = len(speeds)
+    if (len(speeds) not in range(2, tuning.PILOT_COUNT + 1) or
+            len(speeds) != plan.get("pilot_success_count") or
+            not all(_positive(s) for s in speeds)):
+        return state
+    median = statistics.median(speeds)
+    # Normalize before dispersion calculation, avoiding overflow on malformed values.
+    scaled = [s / max(speeds) for s in speeds]
+    ratio = max(speeds) / min(speeds)
+    cv = statistics.pstdev(scaled) / statistics.mean(scaled)
+    if not math.isfinite(ratio) or not _positive(median):
+        return state
+    state.update(median_mbps=median, variation_ratio=ratio, cv=cv)
+    if ratio > 2 or cv > .35:
+        state["status"] = "UNSTABLE"
+        return state
+    band = math.frexp(median)[1] - 1
+    # Practical representable bandwidth bounds; no arbitrary clipping into a band.
+    if not -40 <= band <= 40:
+        return state
+    state.update(status="CLASSIFIED", band=band,
+                 lower_mbps=2.0 ** band, upper_mbps=2.0 ** (band + 1))
+    return state
+
+
+def _utc_stamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return stamp.astimezone(datetime.timezone.utc) if stamp.utcoffset() is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _context_id(result, fingerprint, state):
     plan = result["formal_plan"]
     return _digest({
-        "policy": QUALITY_POLICY_ID, "platform": platform.system(), "network": fingerprint,
+        "policy": QUALITY_POLICY_ID, "history_policy": HISTORY_POLICY_ID,
+        "pilot_speed_band": state["band"], "platform": platform.system(), "network": fingerprint,
         "parameter": result["parameter"], "design": result["design"], "scope": result["scope"],
         "endpoint": tuning.DOWNLOAD_URL, "mode": result["usage_mode"], "rounds": result["rounds"],
         "candidates": sorted(result["candidates"]), "load_policy": result["load_policy"],
@@ -169,7 +219,7 @@ def _attempts(result):
     return pairs + list(partial.values())
 
 
-def _build_rows(result, pairs, records, exclusions):
+def _build_rows(result, pairs, records, exclusions, state):
     run_id, stamp = result["run_id"], result["started_at_utc"]
     fingerprints = {}
 
@@ -226,19 +276,28 @@ def _build_rows(result, pairs, records, exclusions):
     networks = set(fingerprints.values()) - {None}
     if len(networks) != 1:
         exclusions.append("MULTIPLE_NETWORK_CONTEXTS" if networks else "NETWORK_CONTEXT_UNAVAILABLE")
-    context = _context_id(result, networks.pop()) if not exclusions else None
+    context = _context_id(result, networks.pop(), state) if not exclusions else None
     for row in rows:
         row["context_id"] = context
     return rows, context
 
 
-def _history_summary(db, context, candidate, rounds, run_id, mode):
+def _history_summary(db, context, candidate, rounds, run_id, mode, as_of):
     sessions = defaultdict(list)
+    excluded = {"expired": set(), "future": set(), "invalid_time": set()}
     for record in db.execute(
             "SELECT p.* FROM pairs p JOIN runs r ON r.run_id=p.run_id "
             "WHERE p.context_id=? AND p.concurrency=? AND r.admission_reasons='[]' ORDER BY p.created_at,p.run_id,p.pair_id",
             (context, candidate)):
         pair = dict(record)
+        stamp = _utc_stamp(pair["created_at"])
+        # Age is evaluated against the new measurement start, not report export or replay time.
+        # All attempts in a session share a timestamp, including failed/incomplete pairs.
+        reason = ("invalid_time" if stamp is None else "future" if stamp > as_of else
+                  "expired" if (as_of - stamp).total_seconds() > HISTORY_MAX_AGE_SECONDS else None)
+        if reason:
+            excluded[reason].add(pair["run_id"])
+            continue
         pair["pair_id"] = (pair["run_id"], pair["pair_id"])
         pair["reasons"] = json.loads(pair["reasons_json"])
         pair["environment_verified"] = bool(pair["environment_verified"])
@@ -292,7 +351,10 @@ def _history_summary(db, context, candidate, rounds, run_id, mode):
         state = "NEEDS_MORE_EVIDENCE"
     row.update(context_id=context, evidence_state=state, history_run_count=len(compatible),
                history_valid_run_count=valid_runs, current_run_valid_pairs=current_valid,
-               quality_reasons=sorted(set(reasons)))
+               quality_reasons=sorted(set(reasons)),
+               history_expired_run_count=len(excluded["expired"]),
+               history_future_run_count=len(excluded["future"]),
+               history_invalid_time_run_count=len(excluded["invalid_time"]))
     return row
 
 
@@ -315,7 +377,13 @@ def persist_and_analyze(result, records, path=None, app_version=core.VERSION):
         candidates = sorted(result.get("candidates") or [])
         rounds, mode = result["rounds"], result["usage_mode"]
         exclusions = _admission_reasons(result, plan)
-        rows, context = _build_rows(result, attempts, records or [], exclusions)
+        state = pilot_state(plan)
+        as_of = _utc_stamp(result["started_at_utc"])
+        if state["status"] != "CLASSIFIED":
+            exclusions.append("HISTORY_PILOT_STATE_" + state["status"])
+        if as_of is None:
+            exclusions.append("HISTORY_SESSION_TIME_UNVERIFIED")
+        rows, context = _build_rows(result, attempts, records or [], exclusions, state)
         metadata = (run_id, result["started_at_utc"], str(app_version), mode, rounds, _json(candidates),
                     _json(plan), result["status"])
         digest = _digest([metadata, exclusions, rows])
@@ -329,13 +397,16 @@ def persist_and_analyze(result, records, path=None, app_version=core.VERSION):
                 db.executemany(f"INSERT INTO pairs ({','.join(columns)}) VALUES ({','.join(':'+k for k in columns)})", rows)
             elif stored["evidence_digest"] != digest:
                 return _outcome("FAILED", reason="SESSION_ID_CONFLICT")
-            summaries = [_history_summary(db, context, c, rounds, run_id, mode)
+            summaries = [_history_summary(db, context, c, rounds, run_id, mode, as_of)
                          for c in candidates if c > 1] if context else []
             ready = bool(tuning.same_protocol(summaries) and
                          all(s["evidence_state"] in SUPPORTED for s in summaries))
             return _outcome("SAVED" if stored is None else "ALREADY_SAVED", rows=rows, summaries=summaries,
                             ready=ready, run_id=run_id, contextual_pairs=len(rows) if context else 0,
                             admission_reasons=exclusions, storage_scope="per-user-local-app-data",
-                            schema_version=SCHEMA_VERSION, quality_policy_id=QUALITY_POLICY_ID)
+                            schema_version=SCHEMA_VERSION, quality_policy_id=QUALITY_POLICY_ID,
+                            history_policy_id=HISTORY_POLICY_ID, pilot_state=state,
+                            history_max_age_seconds=HISTORY_MAX_AGE_SECONDS,
+                            history_as_of_utc=as_of.isoformat() if as_of is not None else None)
     except (OSError, sqlite3.Error, KeyError, ValueError, TypeError, OverflowError):
         return _outcome("FAILED", reason="LOCAL_HISTORY_STORE_UNAVAILABLE")

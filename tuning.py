@@ -782,7 +782,7 @@ def write_csvs(root,result):
     write('tuning_measurement_summary.csv',result.get('measurement_summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_median_speedup_pct','paired_cv','composite_score','eligible','evidence_state','quality_reasons'])
     write('tuning_summary.csv',result.get('summary',[]),['concurrency','planned_rounds','attempted_rounds','successful_rounds','pair_completion_rate','environment_verified_pairs','environment_unverified_pairs','environment_coverage_rate','environment_coverage_ok','load_verified_pairs','load_unverified_pairs','load_coverage_rate','load_coverage_ok','success_rate','paired_baseline_median_mbps','median_mbps','baseline_variation_ratio','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','quality_reasons','evidence_state'])
     write('tuning_candidate_evidence.csv',result.get('candidate_local_evidence',[]),['concurrency','evidence_state','attempted_pairs','valid_pairs','environment_verified_pairs','environment_coverage_rate','environment_coverage_passed','load_verified_pairs','load_coverage_rate','load_coverage_passed','measurement_quality_passed','measurement_evidence_state','local_evidence_certified','reasons'])
-    write('tuning_history.csv',result.get('historical_evidence',[]),['concurrency','http_version','history_run_count','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','pair_completion_rate','success_rate','paired_median_speedup','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','evidence_state','quality_reasons','context_id'])
+    write('tuning_history.csv',result.get('historical_evidence',[]),['concurrency','http_version','history_run_count','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','pair_completion_rate','success_rate','paired_median_speedup','paired_median_speedup_pct','variation_ratio','paired_cv','paired_latency_ratio','material_gain_pairs','composite_score','eligible','evidence_state','quality_reasons','context_id','history_expired_run_count','history_future_run_count','history_invalid_time_run_count'])
 
 
 def evidence_label(row):
@@ -802,6 +802,15 @@ def history_store_label(store):
     return status
 
 
+def history_state_label(store):
+    state=store.get('pilot_state') or {}
+    status={'CLASSIFIED':'已分层','UNSTABLE':'预探测波动过大','UNVERIFIED':'预探测状态未验证'}.get(state.get('status'),'未执行')
+    if state.get('status')=='CLASSIFIED':
+        status+=f"（{state['lower_mbps']:g} ≤ 速率 < {state['upper_mbps']:g} Mbps）"
+    age=store.get('history_max_age_seconds')
+    return status+(f"；历史窗口 {age/3600:g} 小时" if age else '')
+
+
 def report_html(result):
     esc=lambda x:html.escape(str(x if x is not None else '—'))
     labels={'concurrency':'并发数','paired_rounds':'有效配对数','pair_completion_rate':'配对完成率','paired_baseline_median_mbps':'配对基线中位 Mbps','median_mbps':'候选中位 Mbps','paired_median_speedup_pct':'配对中位提升 %','variation_ratio':'配对比值波动倍数','composite_score':'相对效用','eligible':'合格','quality_reasons':'质量原因','evidence_state':'证据状态','pair_id':'配对编号','baseline_first':'基线先测','valid':'联合有效','measurement_valid':'测量有效','environment_verified':'环境验证','reasons':'原因','baseline_mbps':'基线 Mbps','candidate_mbps':'候选 Mbps','speedup':'速度比','latency_ratio':'基线/候选 TTFB 比'}
@@ -809,17 +818,19 @@ def report_html(result):
         return '<table><tr>'+''.join('<th>'+esc(labels.get(k,k))+'</th>' for k in fields)+'</tr>'+''.join('<tr>'+''.join('<td>'+esc(r.get(k))+'</td>' for k in fields)+'</tr>' for r in rows)+'</table>'
     labels.update(verdict='证据方向',certified='局部认证',attempted_pairs='尝试配对',valid_pairs='有效配对',
                   history_valid_run_count='含有效配对的独立运行',current_run_valid_pairs='本次有效配对',
-                  http_version='HTTP 协议',attempted_rounds='累计尝试')
+                  http_version='HTTP 协议',attempted_rounds='累计尝试',
+                  history_expired_run_count='过期运行',history_future_run_count='晚于本次开始的运行',
+                  history_invalid_time_run_count='时间不可核验的运行')
     local=[dict(r,verdict=evidence_label(r),certified='通过' if r['local_evidence_certified'] else '未通过')
            for r in result.get('candidate_local_evidence',[])]
     history=[dict(r,verdict=evidence_label(r)) for r in result.get('historical_evidence',[])]
     store=result.get('history_store',{})
     validation='<h3>本次候选的局部认证</h3>'+table(local,['concurrency','attempted_pairs','valid_pairs','verdict','certified','reasons']) if local else ''
     if store:
-        validation+='<h3>跨次验证</h3><p>'+esc(history_store_label(store))+'</p>'
+        validation+='<h3>跨次验证</h3><p>'+esc(history_store_label(store))+'；'+esc(history_state_label(store))+'</p>'
         if store.get('admission_reasons'):
             validation+='<p>'+esc('、'.join(store['admission_reasons']))+'</p>'
     if history:
-        validation+=table(history,['concurrency','http_version','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','verdict','quality_reasons'])
+        validation+=table(history,['concurrency','http_version','history_valid_run_count','current_run_valid_pairs','attempted_rounds','paired_rounds','history_expired_run_count','history_future_run_count','history_invalid_time_run_count','verdict','quality_reasons'])
     load_table=table(result.get('load_schedule',[]),['stage','status','waited_seconds','median_total_mbps','max_total_mbps','action'])
     return '<h2>序贯等工作量相邻配对寻优</h2><p>模式：'+esc(result.get('usage_mode'))+'；低负载窗口覆盖：'+esc(result.get('load_window_coverage_ok'))+'；共享负载观察候选：'+esc(result.get('shared_load_observation_concurrency'))+'。物理网卡总流量包含所有应用与协议，不进行进程归因。</p><p>合格子集观察候选（非全局推荐）：'+esc(result.get('qualified_subset_concurrency'))+'；独立停止记录：'+esc(result.get('eliminated_candidates'))+'。</p>'+validation+'<h3>负载感知调度</h3><p>动态阈值不超过 0.5 Mbps；测速后冷却 1 秒，再取 3 个全新非测速区间。共享模式最多等待 8 秒，受控模式最多等待 20 秒。</p>'+load_table+'<p>监测开销：'+esc(result.get('monitoring_overhead'))+'</p><p>测量证据：'+esc(result.get('measurement_evidence_level'))+'；环境证据：'+esc(result.get('environment_evidence_level'))+'；最终等级：'+esc(result.get('evidence_level'))+'；停止原因：'+esc(result.get('stop_reason'))+'；额外配对数：'+esc(result.get('extra_pairs'))+'。证据等级是工程规则，不是统计置信概率。</p><p>建议并发：'+esc(result.get('selected_concurrency'))+'；'+esc(result.get('decision_note'))+'</p><p>预探测独立，正式条件锁定：'+esc(result.get('formal_plan'))+'；正文计划上限 '+esc(result.get('requested_budget_bytes'))+' 字节；实际预留 '+esc(result.get('reserved_bytes'))+'；接收 '+esc(result.get('received_body_bytes'))+'。</p><p>效用基线为 1：配对速度比^0.65 × 完成可靠性^0.25 × 延迟惩罚^0.10。未通过质量门槛不评分。结果仅适用于当前路径及工作量。</p>'+table(result.get('summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_baseline_median_mbps','median_mbps','paired_median_speedup_pct','variation_ratio','composite_score','eligible','quality_reasons','evidence_state'])+'<h3>原始配对</h3>'+table(result.get('pairs',[]),['pair_id','baseline_first','measurement_valid','environment_verified','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio'])
