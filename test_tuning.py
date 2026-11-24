@@ -11,7 +11,7 @@ def good(size):
 
 def fake_batch(exe,c,r,stop,probe=None,total_bytes=t.AGGREGATE_BYTES,clock=None,connect_timeout=5,retest=False,sample_plan=None):
     sizes=t.split_sizes(total_bytes,c); rows=[good(s) for s in sizes]
-    return dict(concurrency=c,round=r,status='OK',expected_bytes=total_bytes,actual_bytes=total_bytes,elapsed_s=1,
+    return dict(concurrency=c,round=r,status='OK',expected_bytes=total_bytes,actual_bytes=total_bytes,elapsed_s=total_bytes*8/1e6/(1 if r==0 else c),
         aggregate_mbps=1 if r==0 else float(c),success=c,planned=c,ttfb_median_ms=100,
         connect_timeout_seconds=connect_timeout,http_blocked=False,worker_rows=rows,retest=retest)
 
@@ -41,11 +41,11 @@ class TuningTests(unittest.TestCase):
     def test_pilot_not_formal_and_controls_locked(self):
         r=self.run_fake()
         self.assertEqual(r['status'],'Completed');self.assertEqual(len(r['pairs']),9)
-        self.assertEqual(len(r['batches']),18);self.assertEqual(r['pilot']['round'],0)
+        self.assertEqual(len(r['batches']),18);self.assertEqual(r['pilot']['round'],0);self.assertEqual(len(r['pilots']),3)
         self.assertEqual({b['expected_bytes'] for b in r['batches']},{r['formal_plan']['total_bytes']})
         self.assertEqual({b['connect_timeout_seconds'] for b in r['batches']},{r['formal_plan']['connect_timeout_seconds']})
         self.assertEqual({b['max_time_seconds'] for b in r['batches']},{20})
-        self.assertEqual(r['reserved_bytes'],t.PILOT_BYTES+sum(b['expected_bytes'] for b in r['batches']))
+        self.assertEqual(r['reserved_bytes'],t.PILOT_COUNT*t.PILOT_BYTES+sum(b['expected_bytes'] for b in r['batches']))
         self.assertLessEqual(r['reserved_bytes'],r['requested_budget_bytes'])
         self.assertIsNone(r['selected_concurrency']);self.assertEqual(r['provisional_concurrency'],8)
     def test_balanced_adjacent_pairs(self):
@@ -57,15 +57,15 @@ class TuningTests(unittest.TestCase):
             order=[p['baseline_first'] for p in r['pairs'] if p['concurrency']==c]
             self.assertNotEqual(order[0],order[1]);self.assertEqual(order[0],order[2])
     def test_slow_pilot_adapts_candidates(self):
-        p=dict(status='OK',aggregate_mbps=.05,worker_rows=[good(t.PILOT_BYTES)])
-        x=t.calibrate(p,(1,2,4,8),t.MAX_TOTAL_BYTES)
+        p=dict(status='OK',actual_bytes=t.PILOT_BYTES,elapsed_s=t.PILOT_BYTES*8/1e6/.05,worker_rows=[good(t.PILOT_BYTES)])
+        x=t.calibrate([p]*3,(1,2,4,8),t.MAX_TOTAL_BYTES)
         self.assertEqual(x['total_bytes'],128*1024);self.assertEqual(x['candidates'],[1,2])
         self.assertEqual(x['excluded_candidates'],[4,8])
     def test_timeout_frozen_and_bounded(self):
         for timing,expected in [(300,5),(3000,8),(30000,10)]:
-            p=dict(status='OK',aggregate_mbps=1,worker_rows=[dict(good(1),dns_ms=0,tcp_ms=0,tls_ms=timing)])
-            self.assertEqual(t.calibrate(p,(1,2),t.MAX_TOTAL_BYTES)['connect_timeout_seconds'],expected)
-        self.assertEqual(t.calibrate({},(1,2),t.MAX_TOTAL_BYTES)['connect_timeout_seconds'],10)
+            p=dict(status='OK',actual_bytes=t.PILOT_BYTES,elapsed_s=1,worker_rows=[dict(good(1),dns_ms=0,tcp_ms=0,tls_ms=timing)])
+            self.assertEqual(t.calibrate([p]*3,(1,2),t.MAX_TOTAL_BYTES)['connect_timeout_seconds'],expected)
+        self.assertEqual(t.calibrate([], (1,2),t.MAX_TOTAL_BYTES)['connect_timeout_seconds'],10)
     def test_reject_mismatched_workload(self):
         r=self.run_fake();a,b=sorted(r['batches'][:2],key=lambda x:x['concurrency'])
         b=dict(b,expected_bytes=b['expected_bytes']*2)
@@ -93,7 +93,8 @@ class TuningTests(unittest.TestCase):
         r=self.run_fake();scores=[s['composite_score'] for s in r['summary']]
         self.assertEqual(scores,sorted(scores));self.assertEqual(len(set(scores)),3)
     def test_no_gain(self):
-        def same(*a,**kw):return dict(fake_batch(*a,**kw),aggregate_mbps=1)
+        def same(*a,**kw):
+            b=fake_batch(*a,**kw);return dict(b,aggregate_mbps=1,elapsed_s=b['actual_bytes']*8/1e6)
         r=self.run_fake(same);self.assertEqual(r['provisional_concurrency'],1)
     def test_one_retest_keeps_failure(self):
         def flaky(*a,**kw):
@@ -122,6 +123,76 @@ class TuningTests(unittest.TestCase):
     def test_cancel(self):
         stop=threading.Event();stop.set()
         with self.assertRaises(core.Cancelled):t.run(stop,exe='curl')
+    def test_median_pilot_and_safe_expansion(self):
+        def pilot(speed):
+            return dict(status='OK',actual_bytes=t.PILOT_BYTES,elapsed_s=t.PILOT_BYTES*8/1e6/speed,worker_rows=[good(t.PILOT_BYTES)])
+        p=t.calibrate([pilot(.13),pilot(.15),pilot(5)],(1,2,4,8),t.MAX_TOTAL_BYTES)
+        self.assertAlmostEqual(p['pilot_speed_mbps'],.15)
+        self.assertEqual(p['candidates'],[1,2])
+        p=t.calibrate([pilot(.15),pilot(.16),pilot(.17)],(1,2,4,8),t.MAX_TOTAL_BYTES)
+        self.assertEqual(p['candidates'],[1,2,4]);self.assertTrue(p['exploration_expanded'])
+    def test_raw_ratio_ignores_rounded_display(self):
+        r=self.run_fake();a,b=sorted(r['batches'][:2],key=lambda x:x['concurrency'])
+        b=dict(b,aggregate_mbps=999)
+        p=t.evaluate_pair(a,b,r['formal_plan'])
+        self.assertAlmostEqual(p['speedup'],a['elapsed_s']/b['elapsed_s'])
+    def test_sequential_stops_when_resolved(self):
+        r=self.run_fake()
+        self.assertEqual(r['extra_pairs'],0);self.assertEqual(r['stop_reason'],'EVIDENCE_SUFFICIENT')
+        self.assertEqual(r['evidence_level'],'SUPPORTED_WITHIN_TESTED_SCOPE')
+    def test_mixed_evidence_gets_multiple_pairs(self):
+        def mixed(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['concurrency']==2:
+                speed=1.2 if b['round']%2 else 1.0
+                b.update(aggregate_mbps=speed,elapsed_s=b['actual_bytes']*8/1e6/speed)
+            return b
+        r=self.run_fake(mixed,candidates=(1,2),rounds=5)
+        self.assertEqual(r['extra_pairs'],3);self.assertEqual(len(r['pairs']),8)
+        self.assertFalse(r['comparison_ready']);self.assertEqual(r['evidence_level'],'TENTATIVE')
+        self.assertEqual(r['stop_reason'],'CANDIDATE_PAIR_LIMIT')
+    def test_irrecoverable_spread_stops_without_retry(self):
+        def varying(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['concurrency']==2:
+                speed=4 if b['round']==1 else 1
+                b.update(aggregate_mbps=speed,elapsed_s=b['actual_bytes']*8/1e6/speed)
+            return b
+        r=self.run_fake(varying,candidates=(1,2))
+        self.assertEqual(r['extra_pairs'],0)
+        self.assertEqual(r['summary'][0]['evidence_state'],'IRRECOVERABLE_SPREAD')
+        self.assertEqual(r['stop_reason'],'NO_RECOVERABLE_CANDIDATE')
+        self.assertFalse(r['comparison_ready'])
+    def test_tentative_never_applied_even_stable(self):
+        r=dict(comparison_ready=False,provisional_concurrency=2,evidence_level='TENTATIVE')
+        e=dict(complete=True,observed_stable=True,telemetry_complete=True,tuning_telemetry_acceptable=True)
+        self.assertIsNone(t.apply_environment_gate(r,e)['selected_concurrency'])
+    def test_pilot_failures_prevent_formal_recommendation(self):
+        calls=[]
+        def partial(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['round']==0:
+                calls.append(1)
+                if len(calls)>1:b.update(status='Failed',actual_bytes=0,aggregate_mbps=None,success=0)
+            return b
+        r=self.run_fake(partial,candidates=(1,2))
+        self.assertEqual(r['formal_plan']['pilot_success_count'],1)
+        self.assertEqual(r['formal_plan']['connect_timeout_seconds'],10)
+        self.assertEqual(r['evidence_level'],'TENTATIVE')
+        self.assertFalse(r['comparison_ready'])
+    def test_global_extra_budget_and_fairness(self):
+        def mixed(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['concurrency']>1:
+                speed=1.2 if b['round']%2 else 1
+                b.update(aggregate_mbps=speed,elapsed_s=b['actual_bytes']*8/1e6/speed)
+            return b
+        r=self.run_fake(mixed,rounds=5)
+        self.assertEqual(r['extra_pairs'],4)
+        self.assertEqual(r['stop_reason'],'EXTRA_PAIR_LIMIT')
+        self.assertEqual([s['attempted_rounds'] for s in r['summary']],[7,6,6])
+        self.assertFalse(r['recommendation_allowed'])
+        self.assertLessEqual(r['reserved_bytes'],r['requested_budget_bytes'])
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
