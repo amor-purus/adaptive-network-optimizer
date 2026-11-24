@@ -18,7 +18,7 @@ class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
         self.font_family=self.configure_fonts(root)
-        root.title('自适应网络优化工具 0.3.6'); root.geometry('1050x880'); root.minsize(900,760)
+        root.title('自适应网络优化工具 0.3.7'); root.geometry('1050x880'); root.minsize(900,760)
         f=ttk.Frame(root,padding=22); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=(self.font_family,22,'bold')).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置',font=(self.font_family,10)).pack(anchor='w',pady=(5,16))
@@ -40,7 +40,7 @@ class App:
         tuning_box=ttk.LabelFrame(f,text='自动参数调优实验',padding=8); tuning_box.pack(fill='x',pady=(0,8))
         ttk.Checkbutton(tuning_box,text='下载并发度寻优（三次预探测；锁定条件；序贯配对）',variable=self.tune).pack(anchor='w')
         ttk.Label(tuning_box,text='固定条件相邻配对；新鲜边界复用；物理网卡每秒采样。仅测当前 HTTPS 路径。',font=(self.font_family,10)).pack(anchor='w')
-        ttk.Label(tuning_box,text='低负载判定：总收发速率低于 0.5 Mbps，连续 3 个采样区间。共享模式最多等待 8 秒；受控模式最多等待 20 秒。',font=(self.font_family,9)).pack(anchor='w',pady=(3,0))
+        ttk.Label(tuning_box,text='低负载：动态阈值不超过 0.5 Mbps；测速后冷却 1 秒，再取 3 个新采样区间。',font=(self.font_family,9)).pack(anchor='w',pady=(3,0))
         ttk.Checkbutton(tuning_box,text='受控实验模式（仅在主动停止其他网络活动时勾选；默认允许正常上网）',variable=self.controlled).pack(anchor='w')
         self.selected={}
         servers=ttk.LabelFrame(f,text='公开 DNS 候选（当前网卡的 IPv4 DNS 自动加入）',padding=8); servers.pack(fill='x',pady=(0,12))
@@ -144,7 +144,7 @@ class App:
                 env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,load_monitor=observer.load_evidence(),ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
                 core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
-                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.6','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.7','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=core.new_report_directory()
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))

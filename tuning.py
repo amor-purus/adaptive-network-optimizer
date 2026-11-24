@@ -293,6 +293,18 @@ def annotate(summary,rounds):
     return summary
 
 
+def traffic_alignment(before,after,started,finished):
+    """All timestamps must use the same monotonic clock. Bound the whole counter envelope."""
+    values=(before.get('started'),before.get('finished'),started,finished,after.get('started'),after.get('finished'))
+    if not all(isinstance(x,(int,float)) and math.isfinite(x) for x in values):
+        return dict(window_alignment='UNVERIFIED_OR_WIDE')
+    b0,b1,s,e,a0,a1=values
+    pre=s-b1;post=a0-e;envelope=(s-b0)+(a1-e)
+    ordered=b0<=b1<=s<=e<=a0<=a1
+    return dict(pre_gap_s=pre,post_gap_s=post,counter_envelope_extra_s=envelope,
+                window_alignment='ALIGNED' if ordered and pre<=.1 and post<=.1 and envelope<=.2 else 'UNVERIFIED_OR_WIDE')
+
+
 def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CONCURRENCY_LEVELS,
         total_bytes=MAX_TOTAL_BYTES,phase_seconds=PHASE_SECONDS,seed=None,clock=time.monotonic,observer=None,usage_mode='shared'):
     if usage_mode not in ('shared','controlled'):raise ValueError('未知使用模式')
@@ -312,7 +324,8 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
                 measurement_summary=[],pilot_environment=None,pair_monitoring_enabled=observer is not None,
                 usage_mode=usage_mode,load_attribution='UNAVAILABLE',boundary_budget_trace=[],
                 load_scheduler_enabled=callable(getattr(observer,'start_load_sampler',None)),load_schedule=[],
-                load_window_coverage_ok=False,load_policy=dict(threshold_mbps=0.5,stable_intervals=3,sample_interval_seconds=1.0,shared_wait_seconds=8,controlled_wait_seconds=20),
+                load_window_coverage_ok=False,load_policy=dict(threshold_mbps=0.5,threshold_cap_mbps=0.5,adaptive=True,cooldown_seconds=1.0,baseline_min_intervals=8,stable_intervals=3,sample_interval_seconds=1.0,shared_wait_seconds=8,controlled_wait_seconds=20),
+                eliminated_candidates=[],qualified_subset_concurrency=None,qualified_subset_candidates=[],
                 retest_status='NotNeeded',retest_candidate=None,blocked=False,comparison_ready=False,
                 recommendation_allowed=False,selected_concurrency=None,provisional_concurrency=None,
                 scope='当前 Cloudflare HTTPS 路径与固定工作量，可能经过代理/TUN；非物理带宽或 yt-dlp -N 参数。')
@@ -323,6 +336,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     result['seed']=seed
     rng=random.Random(seed);deadline=clock()+phase_seconds
     origin=observer.t0 if observer is not None else clock()
+    result['load_clock_origin_s']=origin
     load_monitor=None
     starter=getattr(observer,'start_load_sampler',None) if observer is not None else None
     if callable(starter):
@@ -345,14 +359,25 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         except (core.ProbeError,OSError,ValueError,TypeError):return dict(verified=False,reasons=['PAIR_MONITORING_FAILED'])
     def measure(n,r,size,timeout,retest=False):
         sampler=getattr(observer,'traffic_sample',None)
-        before=sampler() if sampler else None
-        started=clock()-origin;stamp=datetime.datetime.now(datetime.timezone.utc).isoformat()
-        b=run_batch(exe,n,r,stop,probe,size,clock,connect_timeout=timeout,retest=retest)
-        b.update(started_elapsed_s=started,finished_elapsed_s=clock()-origin,
-                 started_at_utc=stamp,finished_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        if sampler:b['traffic']=traffic.delta(before,sampler(),b['actual_bytes'])
-        else:b['traffic']=dict(status='Unavailable',interfaces=[],reason='NO_COUNTER_PROVIDER')
-        return b
+        begin_experiment=getattr(load_monitor,'begin_experiment',None)
+        end_experiment=getattr(load_monitor,'end_experiment',None)
+        marked=callable(begin_experiment) and callable(end_experiment)
+        state=begin_experiment() if marked else None
+        try:
+            before=sampler() if sampler else None
+            started=clock()-origin;stamp=datetime.datetime.now(datetime.timezone.utc).isoformat()
+            b=run_batch(exe,n,r,stop,probe,size,clock,connect_timeout=timeout,retest=retest)
+            finished=clock()-origin
+            b.update(started_elapsed_s=started,finished_elapsed_s=finished,
+                     started_at_utc=stamp,finished_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                     pre_batch_load_state=state,load_isolation_marked=marked)
+            if sampler:
+                after=sampler();b['traffic']=traffic.delta(before,after,b['actual_bytes'])
+                b['traffic'].update(traffic_alignment(before,after,started+origin,finished+origin))
+            else:b['traffic']=dict(status='Unavailable',interfaces=[],reason='NO_COUNTER_PROVIDER')
+            return b
+        finally:
+            if marked:end_experiment()
     def reserve(size,seconds):
         if clock()+seconds>deadline:result['time_budget_exhausted']=True;return False
         if result['reserved_bytes']+size>budget:result['budget_exhausted']=True;return False
@@ -363,6 +388,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         else:
             try:entry=load_monitor.wait_for_idle(stop,timeout)
             except (OSError,ValueError,TypeError):entry=dict(status='LOAD_MONITOR_ERROR',waited_seconds=0)
+        core.check_cancel(stop)
         entry=dict(entry,stage=stage,timeout_seconds=timeout)
         entry['action']='PROCEED_IDLE' if entry.get('status')=='IDLE_WINDOW' else 'PROCEED_SHARED_OBSERVATION' if usage_mode=='shared' else 'SKIP'
         result['load_schedule'].append(entry)
@@ -382,8 +408,9 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
             timeout=max(0,wait_deadline-clock());entry=wait_load(label,timeout);last=entry
             if entry.get('status')=='IDLE_WINDOW':
                 begin=mark('pair_'+label+'_begin')
-                try:confirmed=load_monitor.current_state().get('idle') if load_monitor is not None else False
-                except (OSError,ValueError,TypeError):confirmed=False
+                try:confirmed_state=load_monitor.current_state() if load_monitor is not None else {}
+                except (OSError,ValueError,TypeError):confirmed_state={}
+                confirmed=bool(confirmed_state.get('idle'));entry['confirmed_state']=confirmed_state
                 entry['boundary_confirmation']='IDLE_AFTER_FULL_SNAPSHOT' if confirmed else 'LOAD_ROSE_DURING_FULL_SNAPSHOT'
                 if confirmed:return begin,entry
                 if wait_deadline-clock()>0:continue
@@ -413,7 +440,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         pilot=measure(1,0,PILOT_BYTES,5)
         pilot['pilot_index']=pindex+1
         pilot['load_window']=load_window
-        pilot['load_window_verified']=(not result['load_scheduler_enabled']) or load_window.get('status')=='IDLE_WINDOW'
+        pilot['load_window_verified']=(not result['load_scheduler_enabled']) or (load_window.get('status')=='IDLE_WINDOW' and (pilot.get('pre_batch_load_state') is None or pilot['pre_batch_load_state'].get('idle') is True))
         result['pilots'].append(pilot)
         if pindex==0:result['pilot']=pilot
         result['reserved_bytes']+=PILOT_BYTES;result['received_body_bytes']+=pilot['actual_bytes']
@@ -459,8 +486,10 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         p=evaluate_pair(measured[1],measured[c],plan)
         evidence=window(begin,end,measured[order[0]]['started_elapsed_s'],measured[order[-1]]['finished_elapsed_s'])
         load_verified=(not result['load_scheduler_enabled']) or (load_window.get('status')=='IDLE_WINDOW' and load_window.get('boundary_confirmation','IDLE_AFTER_FULL_SNAPSHOT')=='IDLE_AFTER_FULL_SNAPSHOT')
-        p.update(measurement_valid=bool(p['valid'] and load_verified),
-                  measurement_reasons=list(p['reasons'])+([] if load_verified else ['PAIR_LOAD_WINDOW_NOT_IDLE']),environment=evidence,
+        first_state=measured[order[0]].get('pre_batch_load_state')
+        if first_state is not None and first_state.get('idle') is not True:load_verified=False
+        p.update(measurement_valid=p['valid'],
+                  measurement_reasons=list(p['reasons']),environment=evidence,
                   environment_verified=evidence['verified'],load_window=load_window,load_window_verified=load_verified)
         if not load_verified:
             p['valid']=False
@@ -473,11 +502,19 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
         result['pairs'].append(p)
         return True
     complete=True
+    eliminated=set()
     for r in range(1,rounds+1):
-        order=list(challengers);rng.shuffle(order)
+        order=[c for c in challengers if c not in eliminated];rng.shuffle(order)
         for c in order:
             if not pair(c,r):complete=False;break
+            row=summarize_pairs(result['pairs'],[1,c],rounds)[0]
+            state=evidence_state(row,rounds)
+            if state in ('IRRECOVERABLE_SPREAD','IRRECOVERABLE_COMPARABILITY'):
+                eliminated.add(c)
+                result['eliminated_candidates'].append(dict(concurrency=c,after_round=r,reason=state,
+                    skipped_formal_pairs=rounds-r,variation_ratio=row['variation_ratio']))
         if not complete:break
+        if len(eliminated)==len(challengers):break
     summary=annotate(summarize_pairs(result['pairs'],plan['candidates'],rounds),rounds)
     def trace():
         result['sampling_trace'].append(dict(extra_pairs=result['extra_pairs'],states=[
@@ -511,7 +548,7 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     result['load_window_coverage_ok']=bool(pilot_load_ok and pair_load_ok and complete)
     raw_decision=decide(raw_summary,complete,result['blocked'])
     raw_resolved=bool(raw_summary) and all(s['evidence_state'] in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN') for s in raw_summary)
-    result['measurement_evidence_level']=('SUPPORTED_WITHIN_TESTED_SCOPE' if raw_resolved and raw_decision['comparison_ready'] and len(plan['pilot_speeds_mbps'])>=2 and result['load_window_coverage_ok'] else 'TENTATIVE' if raw_decision['comparison_ready'] else 'INSUFFICIENT')
+    result['measurement_evidence_level']=('SUPPORTED_WITHIN_TESTED_SCOPE' if raw_resolved and raw_decision['comparison_ready'] and len(plan['pilot_speeds_mbps'])>=2 else 'TENTATIVE' if raw_decision['comparison_ready'] else 'INSUFFICIENT')
     result['measurement_provisional_concurrency']=raw_decision['provisional_concurrency']
     result['pair_environment_coverage_ok']=bool(observer is not None and summary and all(
         s['environment_verified_pairs']>=rounds and s['environment_verified_pairs']/max(1,s['attempted_rounds'])>=.75 for s in summary))
@@ -528,8 +565,12 @@ def run(stop,emit=lambda _:None,exe=None,probe=None,rounds=ROUNDS,candidates=CON
     elif 'PAIR_LIMIT_REACHED' in states:reason='CANDIDATE_PAIR_LIMIT'
     else:reason='NO_RECOVERABLE_CANDIDATE'
     result['stop_reason']=reason
+    qualified=[s for s in summary if s['evidence_state'] in ('SUPPORTED_GAIN','SUPPORTED_NO_GAIN')]
+    result['qualified_subset_candidates']=[1]+[s['concurrency'] for s in qualified] if qualified else []
+    if qualified and complete and not result['blocked']:
+        result['qualified_subset_concurrency']=decide(qualified)['provisional_concurrency']
     result.update(decide(summary,complete,result['blocked']))
-    if result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2:
+    if result['comparison_ready'] and resolved and len(plan['pilot_speeds_mbps'])>=2 and result['load_window_coverage_ok']:
         result['evidence_level']='SUPPORTED_WITHIN_TESTED_SCOPE'
     elif result['comparison_ready']:
         result['evidence_level']='TENTATIVE'
@@ -563,6 +604,11 @@ def apply_environment_gate(result,evidence):
     result['recommendation_allowed']=bool(stable and result.get('comparison_ready') and result.get('provisional_concurrency') is not None)
     result['selected_concurrency']=result['provisional_concurrency'] if result['recommendation_allowed'] else None
     result['traffic_coverage']=dict(batches=len(result.get('pilots',[]))+len(result.get('batches',[])),measured=sum(b.get('traffic',{}).get('status')=='Measured' for b in result.get('pilots',[])+result.get('batches',[])))
+    subset=set(result.get('qualified_subset_candidates',[]))-{1}
+    subset_rows=[s for s in result.get('summary',[]) if s['concurrency'] in subset]
+    subset_coverage=bool(subset and {s['concurrency'] for s in subset_rows}==subset and all(
+        s['environment_verified_pairs']>=s['planned_rounds'] and s['environment_verified_pairs']/max(1,s['attempted_rounds'])>=.75 for s in subset_rows))
+    result['qualified_subset_environment_verified']=bool(global_ok and subset_coverage and result.get('qualified_subset_concurrency') is not None)
     result['shared_load_observation_concurrency']=None
     if result.get('usage_mode')=='shared' and result['recommendation_allowed']:
         result['shared_load_observation_concurrency']=result['selected_concurrency']
@@ -588,11 +634,11 @@ def write_csvs(root,result):
             w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
             for r in rows:w.writerow({k:r.get(k) for k in fields})
     batches=result.get('batches',[])
-    traffic_rows=[dict(pair_id=b.get('pair_id'),pilot_index=b.get('pilot_index'),concurrency=b.get('concurrency'),round=b.get('round'),test_body_bytes=b.get('actual_bytes'),interval_seconds=b.get('traffic',{}).get('interval_seconds'),**r) for b in result.get('pilots',[])+batches for r in b.get('traffic',{}).get('interfaces',[])]
-    write('tuning_traffic.csv',traffic_rows,['pair_id','pilot_index','concurrency','round','index','status','reason','hardware','type','test_body_bytes','interval_seconds','rx_bytes','tx_bytes','rx_mbps','tx_mbps','rx_to_test_body_ratio'])
+    traffic_rows=[dict(pair_id=b.get('pair_id'),pilot_index=b.get('pilot_index'),concurrency=b.get('concurrency'),round=b.get('round'),test_body_bytes=b.get('actual_bytes'),interval_seconds=b.get('traffic',{}).get('interval_seconds'),window_alignment=b.get('traffic',{}).get('window_alignment'),pre_gap_s=b.get('traffic',{}).get('pre_gap_s'),post_gap_s=b.get('traffic',{}).get('post_gap_s'),counter_envelope_extra_s=b.get('traffic',{}).get('counter_envelope_extra_s'),**r) for b in result.get('pilots',[])+batches for r in b.get('traffic',{}).get('interfaces',[])]
+    write('tuning_traffic.csv',traffic_rows,['pair_id','pilot_index','concurrency','round','index','status','reason','hardware','type','test_body_bytes','interval_seconds','window_alignment','pre_gap_s','post_gap_s','counter_envelope_extra_s','rx_bytes','tx_bytes','rx_mbps','tx_mbps','rx_to_test_body_ratio'])
     pilot_rows=[dict(p,load_window_status=p.get('load_window',{}).get('status'),load_wait_seconds=p.get('load_window',{}).get('waited_seconds')) for p in result.get('pilots',[])]
     write('tuning_pilots.csv',pilot_rows,['pilot_index','status','expected_bytes','actual_bytes','elapsed_s','aggregate_mbps','started_elapsed_s','finished_elapsed_s','started_at_utc','finished_at_utc','error_categories','load_window_status','load_wait_seconds'])
-    write('tuning_load_schedule.csv',result.get('load_schedule',[]),['stage','status','action','waited_seconds','timeout_seconds','median_total_mbps','max_total_mbps','threshold_mbps','interval_count','boundary_confirmation','reason'])
+    write('tuning_load_schedule.csv',result.get('load_schedule',[]),['stage','status','action','waited_seconds','timeout_seconds','median_total_mbps','max_total_mbps','threshold_mbps','threshold_cap_mbps','baseline_p25_mbps','baseline_mode','baseline_count','interval_count','start_sample_index','end_sample_index','window_start_s','window_end_s','cooldown_until_s','boundary_confirmation','reason'])
     write('tuning_sampling_trace.csv',[dict(extra_pairs=x['extra_pairs'],**s) for x in result.get('sampling_trace',[]) for s in x['states']],['extra_pairs','concurrency','attempted','valid','state','reasons'])
     write('tuning_batches.csv',batches,['pair_id','baseline_for','sequence','concurrency','round','retest','status','expected_bytes','actual_bytes','elapsed_s','aggregate_mbps','started_elapsed_s','finished_elapsed_s','started_at_utc','finished_at_utc','success','planned','ttfb_median_ms','connect_timeout_seconds','max_time_seconds','error_categories'])
     workers=[dict(w,pair_id=b.get('pair_id'),concurrency=b['concurrency'],round=b['round']) for b in batches for w in b.get('worker_rows',[])]
@@ -609,4 +655,4 @@ def report_html(result):
     def table(rows,fields):
         return '<table><tr>'+''.join('<th>'+esc(labels.get(k,k))+'</th>' for k in fields)+'</tr>'+''.join('<tr>'+''.join('<td>'+esc(r.get(k))+'</td>' for k in fields)+'</tr>' for r in rows)+'</table>'
     load_table=table(result.get('load_schedule',[]),['stage','status','waited_seconds','median_total_mbps','max_total_mbps','action'])
-    return '<h2>序贯等工作量相邻配对寻优</h2><p>模式：'+esc(result.get('usage_mode'))+'；低负载窗口覆盖：'+esc(result.get('load_window_coverage_ok'))+'；共享负载观察候选：'+esc(result.get('shared_load_observation_concurrency'))+'。物理网卡总流量包含所有应用与协议，不进行进程归因。</p><h3>负载感知调度</h3><p>阈值 0.5 Mbps；连续 3 个约 1 秒区间。共享模式最多等待 8 秒，受控模式最多等待 20 秒。</p>'+load_table+'<p>监测开销：'+esc(result.get('monitoring_overhead'))+'</p><p>测量证据：'+esc(result.get('measurement_evidence_level'))+'；环境证据：'+esc(result.get('environment_evidence_level'))+'；最终等级：'+esc(result.get('evidence_level'))+'；停止原因：'+esc(result.get('stop_reason'))+'；额外配对数：'+esc(result.get('extra_pairs'))+'。证据等级是工程规则，不是统计置信概率。</p><p>建议并发：'+esc(result.get('selected_concurrency'))+'；'+esc(result.get('decision_note'))+'</p><p>预探测独立，正式条件锁定：'+esc(result.get('formal_plan'))+'；正文计划上限 '+esc(result.get('requested_budget_bytes'))+' 字节；实际预留 '+esc(result.get('reserved_bytes'))+'；接收 '+esc(result.get('received_body_bytes'))+'。</p><p>效用基线为 1：配对速度比^0.65 × 完成可靠性^0.25 × 延迟惩罚^0.10。未通过质量门槛不评分。结果仅适用于当前路径及工作量。</p>'+table(result.get('summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_baseline_median_mbps','median_mbps','paired_median_speedup_pct','variation_ratio','composite_score','eligible','quality_reasons','evidence_state'])+'<h3>原始配对</h3>'+table(result.get('pairs',[]),['pair_id','baseline_first','measurement_valid','environment_verified','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio'])
+    return '<h2>序贯等工作量相邻配对寻优</h2><p>模式：'+esc(result.get('usage_mode'))+'；低负载窗口覆盖：'+esc(result.get('load_window_coverage_ok'))+'；共享负载观察候选：'+esc(result.get('shared_load_observation_concurrency'))+'。物理网卡总流量包含所有应用与协议，不进行进程归因。</p><p>合格子集观察候选（非全局推荐）：'+esc(result.get('qualified_subset_concurrency'))+'；独立停止记录：'+esc(result.get('eliminated_candidates'))+'。</p><h3>负载感知调度</h3><p>动态阈值不超过 0.5 Mbps；测速后冷却 1 秒，再取 3 个全新非测速区间。共享模式最多等待 8 秒，受控模式最多等待 20 秒。</p>'+load_table+'<p>监测开销：'+esc(result.get('monitoring_overhead'))+'</p><p>测量证据：'+esc(result.get('measurement_evidence_level'))+'；环境证据：'+esc(result.get('environment_evidence_level'))+'；最终等级：'+esc(result.get('evidence_level'))+'；停止原因：'+esc(result.get('stop_reason'))+'；额外配对数：'+esc(result.get('extra_pairs'))+'。证据等级是工程规则，不是统计置信概率。</p><p>建议并发：'+esc(result.get('selected_concurrency'))+'；'+esc(result.get('decision_note'))+'</p><p>预探测独立，正式条件锁定：'+esc(result.get('formal_plan'))+'；正文计划上限 '+esc(result.get('requested_budget_bytes'))+' 字节；实际预留 '+esc(result.get('reserved_bytes'))+'；接收 '+esc(result.get('received_body_bytes'))+'。</p><p>效用基线为 1：配对速度比^0.65 × 完成可靠性^0.25 × 延迟惩罚^0.10。未通过质量门槛不评分。结果仅适用于当前路径及工作量。</p>'+table(result.get('summary',[]),['concurrency','paired_rounds','pair_completion_rate','paired_baseline_median_mbps','median_mbps','paired_median_speedup_pct','variation_ratio','composite_score','eligible','quality_reasons','evidence_state'])+'<h3>原始配对</h3>'+table(result.get('pairs',[]),['pair_id','baseline_first','measurement_valid','environment_verified','valid','reasons','baseline_mbps','candidate_mbps','speedup','latency_ratio'])

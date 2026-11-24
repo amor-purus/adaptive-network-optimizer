@@ -307,6 +307,49 @@ class TuningTests(unittest.TestCase):
         e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
         self.assertFalse(t.apply_environment_gate(r,e)['recommendation_allowed'])
 
+    def test_independent_elimination_does_not_certify_global_optimum(self):
+        def varying(*a,**kw):
+            b=fake_batch(*a,**kw)
+            if b['concurrency']==8:
+                speed=8 if b['round']==1 else 1
+                b.update(aggregate_mbps=speed,elapsed_s=b['actual_bytes']*8/1e6/speed)
+            return b
+        r=self.run_fake(varying,observer=FakeObserver())
+        self.assertEqual([p['round'] for p in r['pairs'] if p['concurrency']==8],[1,2])
+        self.assertEqual(r['eliminated_candidates'][0]['skipped_formal_pairs'],1)
+        self.assertEqual(r['qualified_subset_candidates'],[1,2,4])
+        self.assertEqual(r['qualified_subset_concurrency'],4)
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        gated=t.apply_environment_gate(r,e)
+        self.assertTrue(gated['qualified_subset_environment_verified'])
+        self.assertFalse(gated['recommendation_allowed'])
+        self.assertIsNone(gated['selected_concurrency'])
+        e['observed_stable']=False
+        self.assertFalse(t.apply_environment_gate(r,e)['qualified_subset_environment_verified'])
+        self.assertFalse(r['comparison_ready'])
+        self.assertIsNone(r['selected_concurrency'])
+    def test_load_isolation_marks_all_batches_but_does_not_split_pairs(self):
+        class Marker(FakeLoadMonitor):
+            def __init__(self):super().__init__();self.events=[]
+            def begin_experiment(self):self.events.append('begin');return dict(idle=True)
+            def end_experiment(self):self.events.append('end')
+        o=FakeObserver();mark=Marker();o.start_load_sampler=lambda:mark
+        r=self.run_fake(observer=o,candidates=(1,2))
+        self.assertEqual(mark.events,['begin','end']*9)
+        self.assertTrue(all(b['load_isolation_marked'] for b in r['pilots']+r['batches']))
+        self.assertEqual(len(r['load_schedule']),6)
+    def test_raw_measurement_retained_under_busy_load(self):
+        o=FakeObserver();o.start_load_sampler=lambda:FakeLoadMonitor('BUSY_TIMEOUT')
+        r=self.run_fake(observer=o,candidates=(1,2),usage_mode='shared')
+        self.assertTrue(all(p['measurement_valid'] and not p['valid'] for p in r['pairs']))
+        self.assertGreater(r['measurement_summary'][0]['paired_rounds'],0)
+        self.assertFalse(r['comparison_ready'])
+    def test_traffic_alignment_checks_entire_counter_envelope(self):
+        before=dict(started=1.,finished=1.01);after=dict(started=2.01,finished=2.02)
+        self.assertEqual(t.traffic_alignment(before,after,1.02,2.)['window_alignment'],'ALIGNED')
+        self.assertEqual(t.traffic_alignment(dict(before,started=.5),after,1.02,2.)['window_alignment'],'UNVERIFIED_OR_WIDE')
+        self.assertEqual(t.traffic_alignment(before,dict(after,started=1.99),1.02,2.)['window_alignment'],'UNVERIFIED_OR_WIDE')
+        self.assertEqual(t.traffic_alignment({},after,1.02,2.)['window_alignment'],'UNVERIFIED_OR_WIDE')
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
