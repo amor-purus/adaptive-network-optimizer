@@ -7,11 +7,18 @@ from unittest.mock import patch
 import core
 import performance as p
 
-GOOD='200|2|1.1.1.1|0.01|0.02|0.04|0.1|0.2|1000000'
+GOOD='200|2|1.1.1.1|0.01|0.02|0.04|1|2|1000000'
 class PerformanceTests(unittest.TestCase):
     def test_phases(self):
         r=p.parse_curl(GOOD,0,1000000,1000000,1000000)
-        self.assertEqual((r['status'],r['dns_ms'],r['tcp_ms'],r['tls_ms'],r['ttfb_ms'],r['effective_mbps'],r['body_mbps']),('OK',10,10,20,100,40,80))
+        self.assertEqual((r['status'],r['dns_ms'],r['tcp_ms'],r['tls_ms'],r['ttfb_ms'],r['effective_mbps'],r['body_mbps']),('OK',10,10,20,1000,4,8))
+    def test_body_rate_requires_one_second_window(self):
+        short='200|2|1.1.1.1|0.01|0.02|0.04|0.1|0.2|1000000'
+        r=p.parse_curl(short,0,1000000,1000000,1000000)
+        self.assertEqual(r['status'],'OK')
+        self.assertIsNone(r['body_mbps'])
+        self.assertEqual(r['body_rate_status'],'INSUFFICIENT_WINDOW')
+
     def test_bad_telemetry(self):
         for s in ('',GOOD.replace('0.02','nan'),GOOD.replace('0.04','0.001')):
             self.assertEqual(p.parse_curl(s,0,1000000,1000000,1000000)['status'],'Failed')

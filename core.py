@@ -216,6 +216,10 @@ def save_report(directory,data):
         import monitor
         monitor.write_csvs(root,data['environment_monitor'])
         perf_html+=monitor.report_html(data['environment_monitor'])
+    if 'tuning_experiment' in data:
+        import tuning
+        tuning.write_csvs(root,data['tuning_experiment'])
+        perf_html+=tuning.report_html(data['tuning_experiment'])
     esc=lambda x:html.escape(str(x)); s=data['dns_summary']; choice=data['recommendation']
     table='<table><tr><th>DNS</th><th>成功/计划</th><th>中位 ms</th><th>P95 ms</th><th>当前配置</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(x)+'</td>' for x in (r['name']+' '+r['server'],f"{r['success']}/{r['planned']}",r['median_ms'],r['p95_ms'],r['current']))+'</tr>' for r in s)+'</table>'
     validity=data.get('validity',{}); gate=validity.get('recommendation_allowed') is True

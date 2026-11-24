@@ -36,7 +36,7 @@ def stats(values):
 
 
 def parse_curl(output, code, actual, expected, cap):
-    row=dict(status='Failed',exit_code=code,http_status=None,http_version='',remote_ip='',bytes=actual,dns_ms=None,tcp_ms=None,tls_ms=None,ttfb_ms=None,total_ms=None,body_mbps=None,effective_mbps=None,error='',error_category='',raw_timings_s=None)
+    row=dict(status='Failed',exit_code=code,http_status=None,http_version='',remote_ip='',bytes=actual,dns_ms=None,tcp_ms=None,tls_ms=None,ttfb_ms=None,total_ms=None,body_mbps=None,body_rate_status='NOT_MEASURED',effective_mbps=None,error='',error_category='',raw_timings_s=None)
     fields=output.strip().split('|')
     if len(fields)!=len(FIELDS):
         row.update(error='curl 遥测缺失',error_category='TELEMETRY_MISSING'); return row
@@ -71,7 +71,11 @@ def parse_curl(output, code, actual, expected, cap):
     row.update(status='OK',dns_ms=round(dns*1000,3),tcp_ms=round((tcp-dns)*1000,3),tls_ms=round((tls-tcp)*1000,3),ttfb_ms=round(first*1000,3),total_ms=round(total*1000,3))
     if expected and actual:
         row['effective_mbps']=round(actual*8/total/1e6,3)
-        if total-first>=.001:row['body_mbps']=round(actual*8/(total-first)/1e6,3)
+        if total-first>=1.0:
+            row['body_mbps']=round(actual*8/(total-first)/1e6,3)
+            row['body_rate_status']='MEASURED'
+        else:
+            row['body_rate_status']='INSUFFICIENT_WINDOW'
     return row
 
 
@@ -193,4 +197,4 @@ def report_html(perf,base):
     esc=lambda v:html.escape(str(v if v is not None else '—'))
     def table(rows,cols):
         return '<table><tr>'+''.join('<th>'+esc(label)+'</th>' for _,label in cols)+'</tr>'+''.join('<tr>'+''.join('<td>'+esc(r.get(key))+'</td>' for key,_ in cols)+'</tr>' for r in rows)+'</table>' if rows else '<p>无数据或未启用。</p>'
-    return '<h2>实际传输性能（当前路径）</h2><p>'+esc(perf.get('scope'))+'</p><p>'+esc(base.get('note'))+'</p><p>配置快照一致：'+esc(base.get('configuration_observed_stable'))+'；环境：'+esc(base.get('environment'))+'</p><p>curl 使用当前环境代理规则；TCP 可能连接代理，TLS 阶段可能含代理 CONNECT；解析时间不等于公网 DNS 耗时。不会强制直连。</p><h3>HTTPS（Mbps 为十进制，含建连的有效速度）</h3>'+table(perf.get('https_summary',[]),[('target','目标'),('success','成功'),('planned','计划'),('dns_median_ms','解析 ms'),('tcp_median_ms','TCP ms'),('tls_median_ms','TLS ms'),('ttfb_median_ms','TTFB ms'),('ttfb_p95_ms','P95 ms'),('ttfb_jitter_ms','抖动 ms'),('effective_mbps_median','有效 Mbps'),('body_mbps_median','正文 Mbps')])+'<h3>下载实验质量</h3><pre>'+esc(perf.get('download_experiment',{}))+'</pre><h3>失败证据（阶段耗时仅表示已完成阶段）</h3>'+table([r for r in perf.get('https_samples',[]) if r['status']!='OK'],[('target','目标'),('round','轮次'),('error_category','错误类别'),('exit_code','curl 代码'),('bytes','已接收字节'),('ttfb_ms','TTFB ms'),('total_ms','总耗时 ms')])+'<h3>TCP 443</h3>'+table(perf.get('tcp',[]),[('ip','目标'),('success','成功'),('attempted','尝试'),('median_ms','中位 ms'),('p95_ms','P95 ms'),('jitter_ms','抖动 ms')])+'<h3>ICMP（无应答率，不等同全链路丢包率）</h3>'+table(perf.get('icmp',[]),[('ip','目标'),('status','状态'),('success','成功'),('attempted','尝试'),('loss_percent','无应答 %'),('median_ms','中位 ms'),('jitter_ms','抖动 ms')])+'<p>正文接收字节：'+esc(perf.get('received_body_bytes'))+'；'+esc('；'.join(perf.get('warnings',[])))+'</p>'
+    return '<h2>实际传输性能（当前路径）</h2><p>'+esc(perf.get('scope'))+'</p><p>'+esc(base.get('note'))+'</p><p>配置快照一致：'+esc(base.get('configuration_observed_stable'))+'；环境：'+esc(base.get('environment'))+'</p><p>curl 使用当前环境代理规则；TCP 可能连接代理，TLS 阶段可能含代理 CONNECT；解析时间不等于公网 DNS 耗时。不会强制直连。</p><h3>HTTPS（Mbps 为十进制，含建连的有效速度）</h3>'+table(perf.get('https_summary',[]),[('target','目标'),('success','成功'),('planned','计划'),('dns_median_ms','解析 ms'),('tcp_median_ms','TCP ms'),('tls_median_ms','TLS ms'),('ttfb_median_ms','TTFB ms'),('ttfb_p95_ms','P95 ms'),('ttfb_jitter_ms','抖动 ms'),('effective_mbps_median','有效 Mbps'),('body_mbps_median','正文 Mbps')])+'<p>正文吞吐量只在首字节之后至少 1 秒的有效窗口内计算；更短窗口不报告正文速率。</p><h3>下载实验质量</h3><pre>'+esc(perf.get('download_experiment',{}))+'</pre><h3>失败证据（阶段耗时仅表示已完成阶段）</h3>'+table([r for r in perf.get('https_samples',[]) if r['status']!='OK'],[('target','目标'),('round','轮次'),('error_category','错误类别'),('exit_code','curl 代码'),('bytes','已接收字节'),('ttfb_ms','TTFB ms'),('total_ms','总耗时 ms')])+'<h3>TCP 443</h3>'+table(perf.get('tcp',[]),[('ip','目标'),('success','成功'),('attempted','尝试'),('median_ms','中位 ms'),('p95_ms','P95 ms'),('jitter_ms','抖动 ms')])+'<h3>ICMP（无应答率，不等同全链路丢包率）</h3>'+table(perf.get('icmp',[]),[('ip','目标'),('status','状态'),('success','成功'),('attempted','尝试'),('loss_percent','无应答 %'),('median_ms','中位 ms'),('jitter_ms','抖动 ms')])+'<p>正文接收字节：'+esc(perf.get('received_body_bytes'))+'；'+esc('；'.join(perf.get('warnings',[])))+'</p>'

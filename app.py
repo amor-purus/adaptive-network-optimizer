@@ -13,11 +13,12 @@ import core
 import validity
 import performance
 import monitor
+import tuning
 
 class App:
     def __init__(self, root):
         self.root=root; self.stop=threading.Event(); self.queue=queue.Queue(); self.busy=False; self.report=None
-        root.title('自适应网络优化工具 0.2.2'); root.geometry('950x800'); root.minsize(760,660)
+        root.title('自适应网络优化工具 0.3.0'); root.geometry('950x800'); root.minsize(760,660)
         f=ttk.Frame(root,padding=20); f.pack(fill='both',expand=True)
         ttk.Label(f,text='自适应网络优化工具',font=('Microsoft YaHei UI',20)).pack(anchor='w')
         ttk.Label(f,text='无侵入式网络实验 · 先测量，再推荐 · 不修改任何系统配置').pack(anchor='w',pady=(4,14))
@@ -30,12 +31,15 @@ class App:
         ttk.Label(opts,text='MTU IPv4 测试目标').grid(row=0,column=1,sticky='w')
         ttk.Entry(opts,textvariable=self.target,width=20).grid(row=1,column=1,sticky='w')
         ttk.Checkbutton(opts,text='探测 MTU',variable=self.mtu).grid(row=1,column=2,padx=12)
-        self.https=tk.BooleanVar(value=True); self.icmp=tk.BooleanVar(value=True); self.sample=tk.StringVar(value='1')
+        self.https=tk.BooleanVar(value=True); self.icmp=tk.BooleanVar(value=True); self.sample=tk.StringVar(value='1'); self.tune=tk.BooleanVar(value=True)
         perf=ttk.LabelFrame(f,text='实际网络性能（当前路径）',padding=8); perf.pack(fill='x',pady=(0,8))
         ttk.Checkbutton(perf,text='HTTPS 延迟与下载测速',variable=self.https).grid(row=0,column=0,sticky='w')
         ttk.Checkbutton(perf,text='ICMP 多目标测试',variable=self.icmp).grid(row=0,column=1,padx=10,sticky='w')
         ttk.Label(perf,text='单轮下载上限 MiB').grid(row=0,column=2,sticky='w')
         ttk.Combobox(perf,textvariable=self.sample,values=('1','2','4'),state='readonly',width=6).grid(row=0,column=3,padx=5)
+        tuning_box=ttk.LabelFrame(f,text='自动参数调优实验',padding=8); tuning_box.pack(fill='x',pady=(0,8))
+        ttk.Checkbutton(tuning_box,text='下载并发度自动寻优（1 / 2 / 4 / 8 路；固定总样本约 6 MiB）',variable=self.tune).pack(anchor='w')
+        ttk.Label(tuning_box,text='随机化候选顺序，重复 3 轮；只测当前 HTTPS 路径，不修改系统配置，也不直接设置 yt-dlp 参数。').pack(anchor='w')
         self.selected={}
         servers=ttk.LabelFrame(f,text='公开 DNS 候选（当前网卡的 IPv4 DNS 自动加入）',padding=8); servers.pack(fill='x',pady=(0,12))
         for i,(label,ip) in enumerate(core.PRESETS.items()):
@@ -62,9 +66,9 @@ class App:
             rounds=int(self.rounds.get()); mtu=self.mtu.get(); target=str(ipaddress.IPv4Address(self.target.get())) if mtu else None
             if mtu and not ipaddress.ip_address(target).is_global:raise ValueError('MTU 目标须为公开 IPv4 地址。')
         except (ValueError,UnicodeError) as e:messagebox.showerror('输入错误',str(e));return
-        https=self.https.get(); icmp=self.icmp.get(); sample=int(self.sample.get())
+        https=self.https.get(); icmp=self.icmp.get(); sample=int(self.sample.get()); tune=self.tune.get()
         servers={ip:label for label,ip in core.PRESETS.items() if self.selected[ip].get()}
-        if not messagebox.askyesno('确认测量',f'将查询所选 DNS，测试多个公网目标的连接。HTTPS 下载样本计划上限 {sample*(rounds+2)+0.125 if https else 0} MiB（含预探测和最多两次补测），另有小请求、协议及错误开销（非硬流量上限）。服务商可能记录请求；不会修改系统设置。继续？'):return
+        if not messagebox.askyesno('确认测量',f'将查询所选 DNS，测试多个公网目标的连接。HTTPS 下载样本计划上限 {sample*(rounds+2)+0.125 if https else 0} MiB（含预探测和最多两次补测），并发寻优额外计划约 {6 if tune else 0} MiB；另有小请求、协议及错误开销（非硬流量上限）。服务商可能记录请求；不会修改系统设置。继续？'):return
         self.stop.clear(); self.busy=True; self.go.config(state='disabled'); self.cancel.config(state='normal'); self.open.config(state='disabled'); self.report=None
         for item in self.table.get_children():self.table.delete(item)
         def task():
@@ -95,16 +99,24 @@ class App:
                     except (OSError,subprocess.SubprocessError,core.ProbeError):warnings.append('MTU 探测无法运行；DNS 和 TCP 结果仍保留。')
                 core.check_cancel(self.stop)
                 final_snap={}
-                try:final_snap=observer.checkpoint('after_performance','done')
+                try:final_snap=observer.checkpoint('after_performance','tuning' if tune else 'done')
                 except (core.ProbeError,OSError,ValueError):warnings.append('无法取得性能实验后网络快照。')
+                base=monitor.apply_baseline(performance.baseline(perf,after,final_snap),observer.evidence('performance'))
+                tuning_result=dict(status='Disabled',selected_concurrency=None,comparison_ready=False,recommendation_allowed=False,decision='DISABLED',decision_note='用户未启用并发寻优。',batches=[],summary=[],requested_budget_bytes=0,reserved_bytes=0)
+                if tune:
+                    emit('执行下载并发度自动寻优（1 / 2 / 4 / 8）…')
+                    tuning_result=tuning.run(self.stop,emit,exe=performance.curl_path())
+                    try:observer.checkpoint('after_tuning','done')
+                    except (core.ProbeError,OSError,ValueError):warnings.append('无法取得并发寻优结束时网络快照。')
+                    tuning_result=tuning.apply_environment_gate(tuning_result,observer.evidence('tuning'))
                 observer.close()
                 phases=[observer.evidence('dns'),observer.evidence('performance')]
-                base=monitor.apply_baseline(performance.baseline(perf,after,final_snap),phases[1])
+                if tune:phases.append(observer.evidence('tuning'))
                 emit('读取 IPv6 绑定及防火墙配置旁证…')
                 env=dict(timeline=observer.records,phases=phases,interval_seconds=observer.interval,periodic_limit=observer.limit,periodic_limit_reached=observer.periodic>=observer.limit,ipv6_diagnosis=monitor.ipv6_diagnosis(tcp,perf['icmp'],monitor.system_evidence()))
                 core.check_cancel(self.stop)
                 warnings.extend(perf['warnings'])
-                data={'environment_monitor':env,'performance':perf,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.2.2','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
+                data={'environment_monitor':env,'performance':perf,'tuning_experiment':tuning_result,'performance_baseline':base,'snapshot_after_performance':final_snap,'created':datetime.datetime.now().astimezone().isoformat(),'domains':domains,'rounds':rounds,'version':'0.3.0','snapshot':snap,'snapshot_after_dns':after,'validity':gate,'current_dns':current,'dns_samples':rows,'dns_summary':summary,'recommendation':choice,'note':note,'tcp':tcp,'mtu':mt,'warnings':warnings}
                 directory=Path.home()/'Downloads'/'AdaptiveNetworkOptimizer'/(datetime.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
                 report=core.save_report(directory,data); self.queue.put(('result',(data,report)))
             except core.Cancelled:self.queue.put(('error','已取消；未完成的实验不生成推荐。'))
@@ -131,6 +143,8 @@ class App:
                         self.log(f"HTTPS {h['target']}：{h['success']}/{h['planned']}，TTFB {h['ttfb_median_ms']} ms，有效速度 {h['effective_mbps_median']} Mbps")
                     self.log('环境时间线：'+str(len(result['environment_monitor']['timeline']))+' 个采样；配置变化 '+str(sum(len(p['changes']) for p in result['environment_monitor']['phases']))+' 项')
                     self.log('IPv6 诊断：'+result['environment_monitor']['ipv6_diagnosis']['classification'])
+                    tune=result.get('tuning_experiment',{})
+                    self.log('并发寻优：'+(str(tune.get('selected_concurrency'))+' 路' if tune.get('recommendation_allowed') else tune.get('decision_note','未执行')))
                     self.log('下载质量：'+str(result['performance'].get('download_experiment',{}).get('quality',{})))
                     for i in result['performance']['icmp']:
                         self.log(f"ICMP {i['ip']}：无应答 {i['loss_percent']}%，抖动 {i['jitter_ms']} ms")

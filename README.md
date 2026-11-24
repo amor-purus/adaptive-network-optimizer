@@ -1,6 +1,6 @@
 # 自适应网络优化工具（Adaptive Network Optimizer）
 
-**v0.2.2 · Windows 11 · 简体中文 · 只读测试原型**
+**v0.3.0 · Windows 11 · 简体中文 · 只读实验与参数建议原型**
 
 不依赖第三方 Python 库，不需要管理员权限，不修改注册表、DNS、MTU、防火墙、代理或 TCP 参数。
 
@@ -70,3 +70,16 @@
 - IPv6 诊断统计 WSAEACCES 10013，保留 ICMP NativeErrorCode，并读取防火墙配置、IPv6 网卡绑定和地址状态计数；不读取安全事件日志、不修改规则、不确定具体拦截组件。报告包含本地网络信息，分享前检查。
 - JSON 增加 environment_monitor；HTML 增加差分和时间线，另导出 environment_changes.csv、adapter_link_timeline.csv、wlan_timeline.csv。周期采集会增加少量系统负载，不能证明采样间隙不变；仍不进行自动调参。
 - 参考 Microsoft Learn：Get-NetIPInterface、Get-NetAdapter、Get-NetFirewallProfile、Windows Sockets Error Codes。
+
+
+## v0.3.0：自动参数调优实验引擎
+
+- 新增应用层 HTTPS 并发度实验：候选为 1、2、4、8 路，每个候选重复 3 轮；每轮总正文预算固定为 512 KiB，所有候选总计划正文预算 6 MiB。并发请求在同一批次内同时启动，批次聚合速度按完整批次墙钟耗时计算，不累加线程速度。
+- 每轮候选顺序随机化，记录随机种子、候选顺序、逐批结果、逐工作线程字节数/耗时/失败类别。HTTP 403/429 后停止后续批次；请求使用现有 curl/系统代理规则，不强制直连、不跟随重定向、不关闭 TLS 校验。
+- 只有单并发基线和至少一个更高并发候选均完成全部轮次、无高变异且实验完整，才进行比较。若最高吞吐量改善不足 10%，建议保持 1 路；否则选择达到最佳中位聚合速度 95% 以上且至少改善 10% 的最低并发候选。规则是保守工程策略，不是普适最优证明。
+- 并发建议还要求实验期间网络配置快照完整且稳定、网卡链路遥测完整且稳定。采样间隔调整为 45 秒以减少监测开销；阶段边界仍单独采样。离散采样不能证明采样间隙无变化。
+- 正文吞吐量仅在首字节后至少 1 秒的测量窗口内计算；窗口更短时保留有效总耗时速度，但不报告正文 Mbps，避免小样本计时误差夸大速率。
+- 新增 tuning_batches.csv、tuning_workers.csv、tuning_summary.csv、network_telemetry_changes.csv；HTML 报告增加候选对比、逐批结果和链路遥测变化。
+- 并发实验仅代表 Cloudflare HTTPS 下载端点的当前实际路径，可能经过代理/TUN；不代表物理链路，也不等同于 yt-dlp 的分片并发参数 -N。它不会自动修改 yt-dlp、Windows、路由器、DNS、防火墙或代理设置。计划正文预算为 6 MiB，另有 TLS/HTTP 等协议开销。
+- 参考：curl https://curl.se/docs/manpage.html；Cloudflare 测速端点 https://speed.cloudflare.com/。
+

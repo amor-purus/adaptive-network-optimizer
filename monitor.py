@@ -12,7 +12,7 @@ import time
 import core
 import validity
 
-INTERVAL=15
+INTERVAL=45
 MAX_PERIODIC=120
 SECTIONS=('interfaces','dns','routes')
 KEYS={'interfaces':('InterfaceIndex','AddressFamily'),'dns':('InterfaceIndex','AddressFamily'),'routes':('InterfaceIndex','DestinationPrefix','NextHop')}
@@ -118,18 +118,54 @@ class Monitor:
         return phase_evidence(records,phase)
 
 
+def telemetry_available(record):
+    snap=record.get('snapshot') or {}
+    if snap.get('adapter_status')!='Measured' or not isinstance(snap.get('adapters'),list):return False
+    active_wifi=[a for a in snap['adapters'] if a.get('Status')=='Up' and re.search(r'wlan|wi-?fi|wireless',str(a.get('Name','')),re.I)]
+    if active_wifi and record.get('wlan',{}).get('status')!='Measured':return False
+    return True
+
+
+def telemetry_diff(before,after):
+    changes=[]
+    for section,key_fields,fields in (
+        ('adapters',('ifIndex','Name'),('Status','LinkSpeed','ReceiveLinkSpeed','TransmitLinkSpeed','MediaConnectionState')),
+        ('wlan',('name',),('signal_percent','rx_mbps','tx_mbps'))):
+        left=before.get('snapshot',{}).get(section,[]) if section=='adapters' else before.get('wlan',{}).get('interfaces',[])
+        right=after.get('snapshot',{}).get(section,[]) if section=='adapters' else after.get('wlan',{}).get('interfaces',[])
+        def keyed(rows):
+            out={}
+            for row in rows or []:out[tuple(row.get(k) for k in key_fields)]=row
+            return out
+        a,b=keyed(left),keyed(right)
+        for key in sorted(set(a)|set(b),key=str):
+            x,y=a.get(key,{}),b.get(key,{})
+            for field in fields:
+                if x.get(field)!=y.get(field):
+                    changes.append(dict(section=section,identity=list(key),field=field,before=x.get(field),after=y.get(field)))
+    return changes
+
+
 def phase_evidence(records,phase):
-    start='start' if phase=='dns' else 'after_dns'
-    end='after_dns' if phase=='dns' else 'after_performance'
+    bounds={'dns':('start','after_dns'),'performance':('after_dns','after_performance'),
+            'tuning':('after_performance','after_tuning')}
+    if phase not in bounds:raise ValueError('未知实验阶段')
+    start,end=bounds[phase]
     a=next((i for i,r in enumerate(records) if r['label']==start),None)
     b=next((i for i,r in enumerate(records) if r['label']==end),None)
     rs=records[a:b+1] if a is not None and b is not None and a<b else []
-    changes=[]
+    changes=[];telemetry_changes=[]
     for x,y in zip(rs,rs[1:]):
         for c in diff(x['snapshot'],y['snapshot']):
             changes.append(dict(c,from_elapsed_s=x['elapsed_s'],to_elapsed_s=y['elapsed_s'],observed_at=y['observed_at']))
+        for c in telemetry_diff(x,y):
+            telemetry_changes.append(dict(c,from_elapsed_s=x['elapsed_s'],to_elapsed_s=y['elapsed_s'],observed_at=y['observed_at']))
     ok=bool(rs) and all(complete(r['snapshot']) for r in rs)
-    return dict(phase=phase,samples=len(rs),complete=ok,observed_stable=bool(ok and not changes),changes=changes,scope='仅为离散采样观察；变化发生在两次采样之间，未检测到变化不证明持续不变。无法确认人为或自动修改者。')
+    telemetry_ok=bool(rs) and all(telemetry_available(r) for r in rs)
+    return dict(phase=phase,samples=len(rs),complete=ok,observed_stable=bool(ok and not changes),changes=changes,
+                telemetry_complete=telemetry_ok,telemetry_observed_stable=bool(telemetry_ok and not telemetry_changes),
+                telemetry_changes=telemetry_changes,
+                scope='仅为离散采样观察；变化发生在两次采样之间，未检测到变化不证明持续不变。无法确认人为或自动修改者。')
 
 
 def apply_dns_gate(gate,evidence):
@@ -176,6 +212,8 @@ def write_csvs(root,env):
     changes=[dict(c,phase=p['phase']) for p in env['phases'] for c in p['changes']]
     fields=['phase','section','identity','field','before','after','kind','actor','from_elapsed_s','to_elapsed_s','observed_at','before_present','after_present']
     write('environment_changes.csv',changes,fields)
+    telemetry=[dict(c,phase=p['phase']) for p in env['phases'] for c in p.get('telemetry_changes',[])]
+    write('network_telemetry_changes.csv',telemetry,['phase','section','identity','field','before','after','from_elapsed_s','to_elapsed_s','observed_at'])
     rows=[]
     for r in env['timeline']:
         for a in r['snapshot'].get('adapters',[]):
@@ -191,5 +229,7 @@ def write_csvs(root,env):
 def report_html(env):
     esc=lambda x:html.escape(str(x))
     changes=[dict(c,phase=p['phase']) for p in env['phases'] for c in p['changes']]
-    table='<table><tr><th>阶段</th><th>秒</th><th>对象</th><th>字段</th><th>之前</th><th>之后</th><th>判断</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(c[k])+'</td>' for k in ('phase','to_elapsed_s','identity','field','before','after','kind'))+'</tr>' for c in changes)+'</table>'
-    return '<h2>网络环境动态感知</h2><p>定期采样及阶段快照；不会确认修改者，也不会证明采样间隙无变化。</p><p>采样数：'+esc(len(env['timeline']))+'；无线可测次数：'+esc(sum(r['wlan']['status']=='Measured' for r in env['timeline']))+'</p>'+table+'<h3>链路与无线时间线（不含 SSID/BSSID）</h3><pre>'+esc(json.dumps([dict(elapsed_s=r['elapsed_s'],label=r['label'],adapters=r['snapshot'].get('adapters',[]),wlan=r['wlan']) for r in env['timeline']],ensure_ascii=False,indent=2))+'</pre><h3>IPv6 与本地过滤旁证</h3><pre>'+esc(json.dumps(env['ipv6_diagnosis'],ensure_ascii=False,indent=2))+'</pre>'
+    telemetry=[dict(c,phase=p['phase']) for p in env['phases'] for c in p.get('telemetry_changes',[])]
+    table='<table><tr><th>阶段</th><th>秒</th><th>对象</th><th>字段</th><th>之前</th><th>之后</th><th>判断</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(c.get(k))+'</td>' for k in ('phase','to_elapsed_s','identity','field','before','after','kind'))+'</tr>' for c in changes)+'</table>'
+    telemetry_table='<table><tr><th>阶段</th><th>秒</th><th>对象</th><th>字段</th><th>之前</th><th>之后</th></tr>'+''.join('<tr>'+''.join('<td>'+esc(c.get(k))+'</td>' for k in ('phase','to_elapsed_s','identity','field','before','after'))+'</tr>' for c in telemetry)+'</table>'
+    return '<h2>网络环境动态感知</h2><p>配置采样间隔：'+esc(INTERVAL)+' 秒；定期采样及阶段快照不会确认修改者，也不会证明采样间隙无变化。</p><p>采样数：'+esc(len(env['timeline']))+'；无线可测次数：'+esc(sum(r['wlan']['status']=='Measured' for r in env['timeline']))+'</p>'+table+'<h3>链路/无线遥测变化</h3>'+telemetry_table+'<h3>链路与无线时间线（不含 SSID/BSSID）</h3><pre>'+esc(json.dumps([dict(elapsed_s=r['elapsed_s'],label=r['label'],adapters=r['snapshot'].get('adapters',[]),wlan=r['wlan']) for r in env['timeline']],ensure_ascii=False,indent=2))+'</pre><h3>IPv6 与本地过滤旁证</h3><pre>'+esc(json.dumps(env['ipv6_diagnosis'],ensure_ascii=False,indent=2))+'</pre>'

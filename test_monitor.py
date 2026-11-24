@@ -45,9 +45,29 @@ class MonitorTests(unittest.TestCase):
         a=m.Monitor(reader=lambda:BASE,wlan=lambda:{'status':'Unavailable','interfaces':[]})
         a.checkpoint('start');a.start();a.checkpoint('after_dns','performance');a.checkpoint('after_performance','done');a.close()
         self.assertTrue(a.evidence('dns')['observed_stable']);self.assertTrue(a.evidence('performance')['observed_stable'])
+    def test_tuning_phase_and_telemetry_stability(self):
+        def full(label,seconds,rate=866.7):
+            snap=copy.deepcopy(BASE)
+            snap.update(adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',LinkSpeed=str(rate)+' Mbps',ReceiveLinkSpeed=int(rate*1000000),TransmitLinkSpeed=int(rate*1000000),MediaConnectionState=1)])
+            return dict(label=label,phase='tuning',elapsed_s=seconds,observed_at='test',snapshot=snap,wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=rate,tx_mbps=rate)]))
+        rs=[full('after_performance',0),full('periodic',45),full('after_tuning',90)]
+        e=m.phase_evidence(rs,'tuning')
+        self.assertTrue(e['complete']);self.assertTrue(e['observed_stable'])
+        self.assertTrue(e['telemetry_complete']);self.assertTrue(e['telemetry_observed_stable'])
+        changed=[full('after_performance',0),full('periodic',45,433.3),full('after_tuning',90)]
+        e2=m.phase_evidence(changed,'tuning')
+        self.assertFalse(e2['telemetry_observed_stable']);self.assertGreater(len(e2['telemetry_changes']),0)
+
+    def test_tuning_rejects_unavailable_wireless_telemetry(self):
+        a=dict(label='after_performance',elapsed_s=0,snapshot=dict(BASE,adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up')]),wlan=dict(status='Unavailable',interfaces=[]))
+        b=dict(label='after_tuning',elapsed_s=1,snapshot=dict(BASE,adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up')]),wlan=dict(status='Unavailable',interfaces=[]))
+        e=m.phase_evidence([a,b],'tuning')
+        self.assertFalse(e['telemetry_complete'])
+
     def test_exports(self):
         env=dict(timeline=[rec('start',BASE,0)],phases=[],ipv6_diagnosis={'note':'<script>'})
         with tempfile.TemporaryDirectory() as d:
             m.write_csvs(Path(d),env);self.assertTrue((Path(d)/'environment_changes.csv').exists())
+            self.assertTrue((Path(d)/'network_telemetry_changes.csv').exists())
         self.assertIn('&lt;script&gt;',m.report_html(env))
 if __name__=='__main__':unittest.main()
