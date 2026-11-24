@@ -113,6 +113,15 @@ class MonitorTests(unittest.TestCase):
         e=m.phase_evidence([r('after_performance',0,99),r('periodic',45,95),r('after_tuning',90,91)],'tuning')
         self.assertFalse(e['tuning_telemetry_acceptable'])
 
+    def test_cumulative_link_rate_drop_blocks_tuning(self):
+        def r(label,n,rate):
+            s=copy.deepcopy(BASE);s.update(adapter_status='Measured',adapters=[dict(Name='WLAN',Status='Up',ifIndex=16)])
+            return dict(label=label,elapsed_s=n,observed_at='test',snapshot=s,wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=rate)]))
+        e=m.phase_evidence([r('after_performance',0,800),r('periodic',45,650),r('after_tuning',90,550)],'tuning')
+        self.assertTrue(e['telemetry_observed_stable'])
+        self.assertFalse(e['tuning_telemetry_acceptable'])
+        self.assertEqual(len(e['tuning_radio_assessment']['cumulative_rate_drops']),1)
+
     def test_exports(self):
         env=dict(timeline=[rec('start',BASE,0)],phases=[],ipv6_diagnosis={'note':'<script>'})
         with tempfile.TemporaryDirectory() as d:

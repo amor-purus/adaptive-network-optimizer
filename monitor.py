@@ -212,7 +212,8 @@ def tuning_radio_assessment(records,classified):
         for a in r.get('wlan',{}).get('interfaces',[]):
             if a.get('name'):active_names.add(a['name'])
     signals={name:[] for name in active_names}
-    complete=True
+    rates={name:{'rx_mbps':[],'tx_mbps':[]} for name in active_names}
+    complete=bool(records) and all(r.get('snapshot',{}).get('adapters') for r in records)
     for r in records:
         wlan=r.get('wlan',{})
         rows={a.get('name'):a for a in wlan.get('interfaces',[])}
@@ -225,8 +226,16 @@ def tuning_radio_assessment(records,classified):
                 not 0<=values[0]<=100 or min(values[1:])<=0):
                 complete=False;continue
             signals[name].append(values[0])
+            rates[name]['rx_mbps'].append(values[1]);rates[name]['tx_mbps'].append(values[2])
     signal_stable=all(v and max(v)-min(v)<=5 for v in signals.values())
-    hard=[]; advisory=[]; groups={}
+    hard=[]; advisory=[]; groups={}; cumulative_drops=[]
+    for name,fields in rates.items():
+        for field,values in fields.items():
+            peak=0
+            for value in values:
+                peak=max(peak,value)
+                if value<peak*.75:
+                    cumulative_drops.append(dict(adapter=name,field=field,peak_mbps=peak,observed_mbps=value,classification='CUMULATIVE_RATE_DROP'));break
     for c in classified:
         field=c['field']; name=c['identity'][-1] if c.get('identity') else None
         if c.get('severity')!='significant':continue
@@ -244,8 +253,8 @@ def tuning_radio_assessment(records,classified):
                              before_bps=round(k[3]*1e5),after_bps=round(k[4]*1e5),
                              fields=[{'section':x['section'],'field':x['field']} for x in rows],
                              classification='WLAN_UPWARD_RATE_CHANGE_UNATTRIBUTED'))
-    return dict(acceptable=bool(complete and signal_stable and not hard),complete=complete,
-                signal_range_acceptable=signal_stable,advisory_events=advisory,hard_changes=hard,
+    return dict(acceptable=bool(complete and signal_stable and not hard and not cumulative_drops),complete=complete,
+                signal_range_acceptable=signal_stable,advisory_events=advisory,hard_changes=hard,cumulative_rate_drops=cumulative_drops,
                 scope='无线速率上升、信号全程波动≤5个百分点且连接状态不变时仅作旁证；大幅下降、状态变化、缺失或信号超限仍拦截。相同时间与数值变化合并为一个观测事件，不推断因果。')
 
 
