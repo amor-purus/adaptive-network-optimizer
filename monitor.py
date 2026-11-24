@@ -96,13 +96,25 @@ class Monitor:
         except (core.ProbeError,OSError,ValueError,TypeError):s={}
         try:w=self.wlan()
         except (OSError,ValueError,TypeError):w={'status':'Unavailable','reason':'WLAN_QUERY_FAILED','interfaces':[]}
-        self.records.append(dict(label=label,phase=self.phase,observed_at=stamp,elapsed_s=round(t-self.t0,3),capture_seconds=round(time.monotonic()-t,3),snapshot=s,wlan=w))
+        ended=time.monotonic()
+        self.records.append(dict(label=label,phase=self.phase,observed_at=stamp,elapsed_s=round(t-self.t0,3),capture_seconds=round(ended-t,3),capture_start_s=t-self.t0,capture_end_s=ended-self.t0,snapshot=s,wlan=w))
         return s
     def checkpoint(self,label,next_phase=None):
         with self.lock:
             s=self._capture(label)
             if next_phase:self.phase=next_phase
             return s
+    def mark(self,label):
+        """Return an immutable timeline index for a synchronous observation boundary."""
+        with self.lock:
+            self._capture(label)
+            return len(self.records)-1
+
+    def window(self,begin,end,started,finished):
+        with self.lock:
+            records=list(self.records)
+        return window_evidence(records,begin,end,started,finished)
+
     def start(self):
         def loop():
             while not self.stop.wait(self.interval):
@@ -266,6 +278,10 @@ def phase_evidence(records,phase):
     a=next((i for i,r in enumerate(records) if r['label']==start),None)
     b=next((i for i,r in enumerate(records) if r['label']==end),None)
     rs=records[a:b+1] if a is not None and b is not None and a<b else []
+    return records_evidence(rs,phase)
+
+
+def records_evidence(rs,phase):
     changes=[];telemetry_changes=[]
     for x,y in zip(rs,rs[1:]):
         for c in diff(x['snapshot'],y['snapshot']):
@@ -273,10 +289,12 @@ def phase_evidence(records,phase):
         for c in telemetry_diff(x,y):
             telemetry_changes.append(dict(c,from_elapsed_s=x['elapsed_s'],to_elapsed_s=y['elapsed_s'],observed_at=y['observed_at']))
     ok=bool(rs) and all(complete(r['snapshot']) for r in rs)
+    adapter_state_coverage=bool(rs) and all(r['snapshot'].get('adapter_status')=='Measured' and bool(r['snapshot'].get('adapters')) and all(a.get('Name') and a.get('Status') is not None and a.get('MediaConnectionState') is not None for a in r['snapshot']['adapters']) for r in rs)
     telemetry_ok=bool(rs) and all(telemetry_available(r) for r in rs)
     assessment=telemetry_stability(telemetry_changes)
     radio=tuning_radio_assessment(rs,assessment['classified_changes']) if phase=='tuning' else None
     return dict(phase=phase,samples=len(rs),complete=ok,observed_stable=bool(ok and not changes),changes=changes,
+                adapter_state_coverage=adapter_state_coverage,
                 telemetry_complete=telemetry_ok,
                 telemetry_observed_stable=bool(telemetry_ok and assessment['stable']),
                 telemetry_changes=assessment['classified_changes'],
@@ -286,6 +304,26 @@ def phase_evidence(records,phase):
                 tuning_radio_assessment=radio,
                 tuning_telemetry_acceptable=bool(telemetry_ok and radio['acceptable']) if radio is not None else None,
                 scope='配置变化仍严格拦截；无线信号变化不超过 5 个百分点、链路速率变化不超过 25% 时按遥测噪声容差处理。适配器连接状态变化仍严格拦截。仅为离散采样观察，不能证明采样间隙持续不变。')
+
+
+def window_evidence(records,begin,end,started,finished):
+    """A pair is bracketed only by observations taken wholly outside its measurement interval."""
+    reasons=[]
+    valid_indices=(isinstance(begin,int) and isinstance(end,int) and 0<=begin<end<len(records))
+    rs=records[begin:end+1] if valid_indices else []
+    try:
+        pre=rs[0]['capture_end_s'];post=rs[-1]['capture_start_s']
+        bracket=all(isinstance(v,(int,float)) and math.isfinite(v) for v in (pre,post,started,finished)) and pre<=started<=finished<=post and started-pre<=5 and post-finished<=30
+    except (IndexError,KeyError,TypeError,ValueError):
+        bracket=False
+    if not bracket:reasons.append('PAIR_WINDOW_UNBRACKETED')
+    evidence=records_evidence(rs,'tuning')
+    if not evidence['complete'] or not evidence['observed_stable']:reasons.append('PAIR_CONFIGURATION_UNVERIFIED_OR_CHANGED')
+    if not evidence['adapter_state_coverage'] or not evidence['telemetry_complete']:reasons.append('PAIR_TELEMETRY_INCOMPLETE')
+    if not evidence['tuning_telemetry_acceptable']:reasons.append('PAIR_TELEMETRY_OUTSIDE_POLICY')
+    return dict(verified=not reasons,reasons=reasons,begin_index=begin,end_index=end,
+                started_elapsed_s=started,finished_elapsed_s=finished,bracketed=bracket,
+                evidence=evidence,scope='采样区间覆盖实验及相邻间隔；不能确定变化确切发生时刻或证明间隙无变化。')
 
 
 def apply_dns_gate(gate,evidence):

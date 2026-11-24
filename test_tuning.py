@@ -15,6 +15,17 @@ def fake_batch(exe,c,r,stop,probe=None,total_bytes=t.AGGREGATE_BYTES,clock=None,
         aggregate_mbps=1 if r==0 else float(c),success=c,planned=c,ttfb_median_ms=100,
         connect_timeout_seconds=connect_timeout,http_blocked=False,worker_rows=rows,retest=retest)
 
+class FakeObserver:
+    t0=0
+    def __init__(self,bad=()):
+        self.labels=[];self.bad=set(bad)
+    def mark(self,label):
+        self.labels.append(label);return len(self.labels)-1
+    def window(self,begin,end,started,finished):
+        label=self.labels[begin]
+        ok=label not in self.bad
+        return dict(verified=ok,reasons=[] if ok else ['PAIR_TELEMETRY_OUTSIDE_POLICY'],begin_index=begin,end_index=end)
+
 class TuningTests(unittest.TestCase):
     def run_fake(self,func=fake_batch,**kwargs):
         with patch('tuning.run_batch',side_effect=func):
@@ -116,7 +127,9 @@ class TuningTests(unittest.TestCase):
     def test_missing_or_unstable_environment(self):
         r=self.run_fake()
         self.assertIsNone(t.apply_environment_gate(r,{})['selected_concurrency'])
-        e=dict(complete=True,observed_stable=True,telemetry_complete=True,telemetry_observed_stable=False,tuning_telemetry_acceptable=True)
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_complete=True,telemetry_observed_stable=False,tuning_telemetry_acceptable=True)
+        self.assertIsNone(t.apply_environment_gate(r,e)['selected_concurrency'])
+        r=self.run_fake(observer=FakeObserver())
         self.assertEqual(t.apply_environment_gate(r,e)['selected_concurrency'],8)
         e['observed_stable']=False
         self.assertIsNone(t.apply_environment_gate(r,e)['selected_concurrency'])
@@ -193,6 +206,66 @@ class TuningTests(unittest.TestCase):
         self.assertEqual([s['attempted_rounds'] for s in r['summary']],[7,6,6])
         self.assertFalse(r['recommendation_allowed'])
         self.assertLessEqual(r['reserved_bytes'],r['requested_budget_bytes'])
+    def test_contaminated_pair_is_retained_and_retested(self):
+        o=FakeObserver(['pair_C2-R1_begin'])
+        r=self.run_fake(candidates=(1,2),observer=o)
+        self.assertEqual(r['extra_pairs'],1)
+        self.assertEqual(len(r['pairs']),4)
+        p=r['pairs'][0]
+        self.assertTrue(p['measurement_valid']);self.assertFalse(p['environment_verified']);self.assertFalse(p['valid'])
+        self.assertEqual(r['summary'][0]['pair_completion_rate'],.75)
+        self.assertEqual(r['measurement_summary'][0]['paired_rounds'],4)
+        self.assertEqual(r['summary'][0]['paired_rounds'],3)
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        self.assertEqual(t.apply_environment_gate(r,e)['selected_concurrency'],2)
+
+    def test_pilot_radio_change_not_global_radio_veto(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver(['tuning_pilot_begin']))
+        self.assertFalse(r['pilot_environment']['verified'])
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_complete=True,
+               tuning_telemetry_acceptable=False,telemetry_changes=[dict(field='signal_percent')])
+        gated=t.apply_environment_gate(r,e)
+        self.assertEqual(gated['selected_concurrency'],2)
+        self.assertEqual(gated['environment_evidence_level'],'VERIFIED_PAIR_SCOPE')
+        e['telemetry_changes'].append(dict(field='Status'))
+        gated=t.apply_environment_gate(r,e)
+        self.assertIsNone(gated['selected_concurrency'])
+        self.assertEqual(gated['measurement_evidence_level'],'SUPPORTED_WITHIN_TESTED_SCOPE')
+        self.assertEqual(gated['environment_evidence_level'],'INSUFFICIENT')
+
+    def test_missing_local_coverage_never_recommends(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver(['pair_C2-R%d_begin'%n for n in range(1,7)]))
+        e=dict(complete=True,observed_stable=True,adapter_state_coverage=True,telemetry_changes=[])
+        self.assertFalse(r['pair_environment_coverage_ok'])
+        self.assertIsNone(t.apply_environment_gate(r,e)['selected_concurrency'])
+        self.assertEqual(r['measurement_evidence_level'],'SUPPORTED_WITHIN_TESTED_SCOPE')
+
+    def test_batch_timestamps_and_boundary_budget(self):
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver())
+        self.assertTrue(all('started_at_utc' in b and 'finished_elapsed_s' in b for b in r['batches']+r['pilots']))
+        r=self.run_fake(candidates=(1,2),observer=FakeObserver(),phase_seconds=135)
+        self.assertTrue(r['time_budget_exhausted']);self.assertEqual(r['batches'],[])
+
+    def test_real_monitor_integration_without_network(self):
+        import monitor
+        snap=dict(interfaces=[dict(InterfaceIndex=16,AddressFamily=2)],dns=[],routes=[],
+                  adapter_status='Measured',adapters=[dict(Name='WLAN',ifIndex=16,Status='Up',MediaConnectionState=1)])
+        wlan=dict(status='Measured',interfaces=[dict(name='WLAN',signal_percent=99,rx_mbps=866.7,tx_mbps=866.7)])
+        observer=monitor.Monitor(reader=lambda:snap,wlan=lambda:wlan)
+        observer.checkpoint('after_performance','tuning')
+        with patch('tuning.run_batch',side_effect=fake_batch):
+            r=t.run(threading.Event(),exe='curl',seed=4,candidates=(1,2),observer=observer)
+        observer.checkpoint('after_tuning','done')
+        self.assertEqual(len(r['pairs']),3)
+        for p in r['pairs']:
+            e=p['environment'];self.assertTrue(e['verified'])
+            before=observer.records[e['begin_index']];after=observer.records[e['end_index']]
+            self.assertLessEqual(before['capture_end_s'],e['started_elapsed_s'])
+            self.assertLessEqual(e['finished_elapsed_s'],after['capture_start_s'])
+        gated=t.apply_environment_gate(r,observer.evidence('tuning'))
+        self.assertEqual(gated['selected_concurrency'],2)
+        self.assertEqual(gated['environment_evidence_level'],'VERIFIED_PAIR_SCOPE')
+
     def test_exports(self):
         r=self.run_fake();r['decision_note']='<script>'
         with tempfile.TemporaryDirectory() as d:
